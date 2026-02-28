@@ -2,10 +2,14 @@
 title Telegram AI Secretary
 cd /d "%~dp0"
 
-REM ─── Set your credentials here ───
-REM Or set them as system environment variables
-if "%TELEGRAM_BOT_TOKEN%"=="" set TELEGRAM_BOT_TOKEN=8653492472:AAG_54x92Lmb1dWHVX9AO6Pqp3lNCwYoOyM
-if "%TELEGRAM_CHAT_ID%"=="" set TELEGRAM_CHAT_ID=7560692069
+REM ─── Load credentials from .env file ───
+for /f "usebackq tokens=1,2 delims==" %%a in (".env") do (
+    if "%%a"=="TELEGRAM_BOT_TOKEN" set TELEGRAM_BOT_TOKEN=%%b
+    if "%%a"=="TELEGRAM_CHAT_ID" set TELEGRAM_CHAT_ID=%%b
+)
+
+REM ─── Prevent "nested session" error if launched from Claude Code ───
+set CLAUDECODE=
 
 echo ==========================================
 echo   Telegram AI Secretary
