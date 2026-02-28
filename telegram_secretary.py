@@ -616,12 +616,8 @@ def main():
         task_msg = interrupted.get("user_msg", "")
         task_time = interrupted.get("timestamp", "")
         log(f"Found interrupted task: {task_msg[:60]}...")
-        send_msg(
-            f"🟢 秘书重新上线了！\n\n"
-            f"上次掉线前正在处理你的指令：\n"
-            f"「{task_msg[:100]}」\n\n"
-            f"需要我继续处理吗？回复『继续』我就接着做 👍"
-        )
+        restart_text = "秘书重新上线了!\n\n上次掉线前正在处理你的指令:\n" + task_msg[:100] + "\n\n需要我继续处理吗? 回复 继续 我就接着做"
+        send_msg(restart_text)
         # Clear the interrupted task so we don't ask again on next restart
         memory["current_task"] = {"status": "interrupted_notified", "user_msg": task_msg}
         save_memory(memory)
