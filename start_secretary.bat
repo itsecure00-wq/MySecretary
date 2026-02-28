@@ -19,8 +19,10 @@ echo Chat ID: %TELEGRAM_CHAT_ID%
 echo ==========================================
 echo.
 
+:loop
 python telegram_secretary.py
-
 echo.
-echo Secretary stopped. Press any key to exit.
-pause >nul
+echo [%time%] Secretary crashed or stopped. Restarting in 5 seconds...
+echo Press Ctrl+C to stop permanently.
+timeout /t 5 /nobreak >nul
+goto loop

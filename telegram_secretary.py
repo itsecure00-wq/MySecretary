@@ -3,6 +3,7 @@
 Telegram AI Secretary — 远程遥控 Claude Code
 通过 Telegram 和 AI 秘书对话，秘书自动调 Claude Code 执行编码任务。
 支持语音消息：发送语音 → 自动转文字 → 交给 Claude 处理
+支持图片/文件：发截图或文件 → 保存本地 → 交给 Claude 处理
 """
 
 import json
@@ -12,6 +13,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -48,8 +50,8 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SCRIPT_DIR = Path(__file__).parent
 MEMORY_FILE = SCRIPT_DIR / "memory.json"
 SYSTEM_PROMPT_FILE = SCRIPT_DIR / "system_prompt.txt"
-CLAUDE_TIMEOUT = 300  # 5 minutes max per command
-MAX_TURNS = 15
+CLAUDE_TIMEOUT = 600  # 10 minutes max per command
+MAX_TURNS = 50
 DEFAULT_MODEL = "sonnet"
 DEFAULT_CWD = os.environ.get(
     "SECRETARY_CWD",
@@ -70,6 +72,10 @@ FFPROBE_PATH = os.path.join(FFMPEG_DIR, "ffprobe.exe")
 if VOICE_ENABLED:
     AudioSegment.converter = FFMPEG_PATH
     AudioSegment.ffprobe = FFPROBE_PATH
+
+# Temp directory for received files
+RECEIVED_DIR = SCRIPT_DIR / "received_files"
+RECEIVED_DIR.mkdir(exist_ok=True)
 
 
 # ─── Telegram API ────────────────────────────────────────────────
@@ -104,6 +110,52 @@ def send_msg(text, chat_id=None):
             time.sleep(0.5)  # avoid rate limit
 
 
+def send_file(file_path, caption=""):
+    """Send a file to user via Telegram sendDocument (multipart upload)."""
+    file_path = str(file_path)
+    if not os.path.isfile(file_path):
+        log(f"send_file: file not found: {file_path}")
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    boundary = "----SecretaryFileBoundary"
+    file_name = os.path.basename(file_path)
+
+    try:
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        # Build multipart body
+        body = b""
+        # chat_id field
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{CHAT_ID}\r\n'.encode()
+        # caption field (if any)
+        if caption:
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode()
+        # document field
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="document"; filename="{file_name}"\r\n'.encode()
+        body += b"Content-Type: application/octet-stream\r\n\r\n"
+        body += file_data
+        body += f"\r\n--{boundary}--\r\n".encode()
+
+        req = urllib.request.Request(url, data=body)
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+            if resp.get("ok"):
+                log(f"File sent: {file_name}")
+                return True
+            else:
+                log(f"send_file failed: {resp}")
+                return False
+    except Exception as e:
+        log(f"send_file error: {e}")
+        return False
+
+
 def split_message(text, max_len=4000):
     """Split long text into chunks, trying to break at newlines."""
     if len(text) <= max_len:
@@ -120,6 +172,63 @@ def split_message(text, max_len=4000):
         chunks.append(text[:idx])
         text = text[idx:].lstrip("\n")
     return chunks
+
+
+# ─── Typing Indicator ─────────────────────────────────────────────
+class TypingIndicator:
+    """Send 'typing...' action to Telegram while Claude is processing."""
+
+    def __init__(self):
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._send_loop()
+
+    def _send_loop(self):
+        if self._running:
+            tg_api("sendChatAction", {"chat_id": CHAT_ID, "action": "typing"})
+            self._thread = threading.Timer(4.0, self._send_loop)
+            self._thread.daemon = True
+            self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.cancel()
+            self._thread = None
+
+
+# ─── File Download from Telegram ──────────────────────────────────
+def download_telegram_file(file_id, suffix=None, filename=None):
+    """Download any file from Telegram by file_id. Returns local path or None."""
+    resp = tg_api("getFile", {"file_id": file_id})
+    if not resp.get("ok"):
+        return None
+    tg_file_path = resp["result"]["file_path"]
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file_path}"
+
+    if filename:
+        local_path = str(RECEIVED_DIR / filename)
+    elif suffix:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        local_path = str(RECEIVED_DIR / f"file_{ts}{suffix}")
+    else:
+        ext = os.path.splitext(tg_file_path)[1] or ".bin"
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        local_path = str(RECEIVED_DIR / f"file_{ts}{ext}")
+
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as r:
+            with open(local_path, "wb") as f:
+                f.write(r.read())
+        log(f"Downloaded file: {local_path}")
+        return local_path
+    except Exception as e:
+        log(f"File download error: {e}")
+        return None
 
 
 # ─── Voice Transcription ────────────────────────────────────────
@@ -144,7 +253,7 @@ def download_voice(file_id):
 
 
 def transcribe_voice(ogg_path):
-    """Convert OGG voice to text using Google Speech Recognition (Chinese)."""
+    """Convert OGG voice to text. Tries Chinese first, then English."""
     if not VOICE_ENABLED:
         return None
     wav_path = ogg_path.replace(".ogg", ".wav")
@@ -153,14 +262,20 @@ def transcribe_voice(ogg_path):
         audio = AudioSegment.from_ogg(ogg_path)
         audio.export(wav_path, format="wav")
 
-        # Recognize speech (Google free API, supports Chinese)
+        # Recognize speech — try Chinese first, then English
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-        text = recognizer.recognize_google(audio_data, language="zh-CN")
-        return text
-    except sr.UnknownValueError:
-        return None  # Could not understand
+
+        for lang in ["zh-CN", "en-US"]:
+            try:
+                text = recognizer.recognize_google(audio_data, language=lang)
+                if text:
+                    log(f"Voice recognized ({lang}): {text[:60]}...")
+                    return text
+            except sr.UnknownValueError:
+                continue
+        return None
     except Exception as e:
         log(f"Transcription error: {e}")
         return None
@@ -184,6 +299,7 @@ def load_memory():
     return {
         "tasks": [],
         "notes": [],
+        "history": [],
         "current_model": DEFAULT_MODEL,
         "cwd": DEFAULT_CWD
     }
@@ -195,6 +311,16 @@ def save_memory(memory):
         json.dumps(memory, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+
+
+def add_history(memory, user_msg, response):
+    """Add conversation summary to memory history (keep last 20)."""
+    ts = time.strftime("%m/%d %H:%M")
+    user_short = user_msg[:50].replace("\n", " ")
+    resp_short = response[:80].replace("\n", " ")
+    entry = f"[{ts}] 老板: {user_short} → 秘书: {resp_short}"
+    memory.setdefault("history", []).append(entry)
+    memory["history"] = memory["history"][-20:]  # Keep last 20
 
 
 # ─── Claude Code ─────────────────────────────────────────────────
@@ -210,6 +336,12 @@ def run_claude(prompt, memory, continue_session=True):
     model = memory.get("current_model", DEFAULT_MODEL)
     cwd = memory.get("cwd", DEFAULT_CWD)
     system_prompt = load_system_prompt()
+
+    # Prepend recent conversation history for context
+    history = memory.get("history", [])
+    if history:
+        recent = "\n".join(history[-5:])
+        prompt = f"[最近对话记录]\n{recent}\n\n[当前消息]\n{prompt}"
 
     # Build command
     cmd = [CLAUDE_CMD]
@@ -265,11 +397,13 @@ def handle_command(text, memory):
         c = memory.get("cwd", DEFAULT_CWD)
         tasks = memory.get("tasks", [])
         pending = [t for t in tasks if t.get("status") != "done"]
+        history_count = len(memory.get("history", []))
         return (
             f"📊 当前状态\n"
             f"工作目录：{c}\n"
             f"模型：{m}\n"
             f"待办任务：{len(pending)} 个\n"
+            f"对话记忆：{history_count} 条\n"
             f"语音支持：{'✅' if VOICE_ENABLED else '❌'}"
         ), False
 
@@ -308,8 +442,21 @@ def handle_command(text, memory):
 
 
 def parse_cmd_tags(response, memory):
-    """Parse [CMD:...] tags from Claude's response and execute them."""
+    """Parse [CMD:...] and [FILE:...] tags from Claude's response."""
     changed = False
+    new_session = False
+
+    # Parse [FILE:path] tags — send files to user
+    file_matches = re.findall(r'\[FILE:(.*?)\]', response)
+    for fpath in file_matches:
+        fpath = fpath.strip()
+        if os.path.isfile(fpath):
+            send_file(fpath)
+        else:
+            log(f"[FILE:] path not found: {fpath}")
+    response = re.sub(r'\[FILE:.*?\]', '', response).strip()
+
+    # Parse [CMD:action arg] tags
     cmd_match = re.search(r'\[CMD:(\w+)\s*(.*?)\]', response)
     if cmd_match:
         action = cmd_match.group(1).lower()
@@ -328,11 +475,12 @@ def parse_cmd_tags(response, memory):
                 changed = True
                 log(f"Auto-executed: /model {arg}")
         elif action == "new":
-            changed = True  # Signal to reset session
+            new_session = True
             log("Auto-executed: /new")
+
     if changed:
         save_memory(memory)
-    return response, changed
+    return response, new_session
 
 
 # ─── Main Loop ───────────────────────────────────────────────────
@@ -362,11 +510,13 @@ def main():
     memory = load_memory()
     log(f"Working directory: {memory.get('cwd', DEFAULT_CWD)}")
     log(f"Model: {memory.get('current_model', DEFAULT_MODEL)}")
+    log(f"History entries: {len(memory.get('history', []))}")
 
     # Send startup notification
     voice_status = "🎤 语音已启用" if VOICE_ENABLED else "⌨️ 仅文字模式"
     send_msg(f"🟢 秘书上线了！{voice_status}\n有什么吩咐随时说～")
 
+    typing = TypingIndicator()
     offset = 0
     continue_session = False
 
@@ -388,6 +538,7 @@ def main():
                 msg = update.get("message", {})
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "").strip()
+                caption = msg.get("caption", "").strip()
 
                 # Security: only respond to configured chat ID
                 if chat_id != CHAT_ID:
@@ -405,18 +556,35 @@ def main():
                         ogg_path = download_voice(file_id)
                         if ogg_path:
                             text = transcribe_voice(ogg_path)
-                            if text:
-                                log(f"Voice transcribed: {text[:80]}...")
-                            else:
+                            if not text:
                                 send_msg("抱歉老板，没听清楚，能再说一次吗？ 🙉")
                                 continue
                         else:
                             send_msg("语音下载失败了，请重新发送")
                             continue
 
+                # ── Handle photo ──
+                photo = msg.get("photo")
+                if photo:
+                    # Telegram sends multiple sizes, take largest
+                    file_id = photo[-1]["file_id"]
+                    path = download_telegram_file(file_id, suffix=".jpg")
+                    if path:
+                        text = (text or caption or "") + f"\n[用户发了一张图片，已保存在: {path}]"
+
+                # ── Handle document/file ──
+                doc = msg.get("document")
+                if doc:
+                    file_name = doc.get("file_name", "file")
+                    file_id = doc["file_id"]
+                    path = download_telegram_file(file_id, filename=file_name)
+                    if path:
+                        text = (text or caption or "") + f"\n[用户发了文件 {file_name}，已保存在: {path}]"
+
                 if not text:
                     continue
 
+                text = text.strip()
                 log(f"Received: {text[:80]}...")
 
                 # Handle special commands (still support /commands as fallback)
@@ -439,13 +607,22 @@ def main():
                     continue
 
                 # Normal message → send to Claude Code
-                response = run_claude(text, memory, continue_session)
+                typing.start()
+                try:
+                    response = run_claude(text, memory, continue_session)
+                finally:
+                    typing.stop()
+
                 continue_session = True  # subsequent messages continue conversation
 
-                # Parse any [CMD:...] tags from Claude's response
-                response, had_cmd = parse_cmd_tags(response, memory)
-                if had_cmd and "new" in str(had_cmd):
+                # Parse any [CMD:...] and [FILE:...] tags
+                response, reset_session = parse_cmd_tags(response, memory)
+                if reset_session:
                     continue_session = False
+
+                # Save conversation history
+                add_history(memory, text, response)
+                save_memory(memory)
 
                 send_msg(response)
                 log(f"Responded ({len(response)} chars)")
