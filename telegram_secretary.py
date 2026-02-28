@@ -541,9 +541,25 @@ def main():
     log(f"Model: {memory.get('current_model', DEFAULT_MODEL)}")
     log(f"History entries: {len(memory.get('history', []))}")
 
-    # Send startup notification
-    voice_status = "🎤 语音已启用" if VOICE_ENABLED else "⌨️ 仅文字模式"
-    send_msg(f"🟢 秘书上线了！{voice_status}\n有什么吩咐随时说～")
+    # Check for interrupted task from previous crash
+    interrupted = memory.get("current_task")
+    if interrupted and interrupted.get("status") == "processing":
+        task_msg = interrupted.get("user_msg", "")
+        task_time = interrupted.get("timestamp", "")
+        log(f"Found interrupted task: {task_msg[:60]}...")
+        send_msg(
+            f"🟢 秘书重新上线了！\n\n"
+            f"上次掉线前正在处理你的指令：\n"
+            f"「{task_msg[:100]}」\n\n"
+            f"需要我继续处理吗？回复"继续"我就接着做 👍"
+        )
+        # Clear the interrupted task so we don't ask again on next restart
+        memory["current_task"] = {"status": "interrupted_notified", "user_msg": task_msg}
+        save_memory(memory)
+    else:
+        # Normal startup
+        voice_status = "🎤 语音已启用" if VOICE_ENABLED else "⌨️ 仅文字模式"
+        send_msg(f"🟢 秘书上线了！{voice_status}\n有什么吩咐随时说～")
 
     typing = TypingIndicator()
     offset = 0
@@ -638,11 +654,23 @@ def main():
                 # Normal message → send to Claude Code
                 # Immediately acknowledge receipt so user knows we're working
                 send_msg("收到～正在处理中，稍等一下 ⏳")
+
+                # Track current task in case of crash
+                memory["current_task"] = {
+                    "status": "processing",
+                    "user_msg": text[:200],
+                    "timestamp": time.strftime("%m/%d %H:%M")
+                }
+                save_memory(memory)
+
                 typing.start()
                 try:
                     response = run_claude(text, memory, continue_session)
                 finally:
                     typing.stop()
+
+                # Task completed — clear tracking
+                memory["current_task"] = {"status": "done"}
 
                 continue_session = True  # subsequent messages continue conversation
 
