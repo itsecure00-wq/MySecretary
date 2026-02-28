@@ -343,13 +343,59 @@ def save_memory(memory):
 
 
 def add_history(memory, user_msg, response):
-    """Add conversation summary to memory history (keep last 20)."""
+    """Add conversation summary to memory. Uses tiered memory:
+    - history: last 50 detailed entries (recent conversations)
+    - daily_summaries: compressed daily summaries, kept for 30 days
+    When old entries get pushed out, they're compressed into daily summaries.
+    """
+    today = time.strftime("%m/%d")
     ts = time.strftime("%m/%d %H:%M")
-    user_short = user_msg[:50].replace("\n", " ")
-    resp_short = response[:80].replace("\n", " ")
+    user_short = user_msg[:80].replace("\n", " ")
+    resp_short = response[:120].replace("\n", " ")
     entry = f"[{ts}] 老板: {user_short} → 秘书: {resp_short}"
-    memory.setdefault("history", []).append(entry)
-    memory["history"] = memory["history"][-20:]  # Keep last 20
+
+    history = memory.setdefault("history", [])
+    history.append(entry)
+
+    # Before trimming, compress old entries into daily summaries
+    if len(history) > 50:
+        # Entries that will be removed
+        overflow = history[:-50]
+        _compress_to_daily(memory, overflow)
+        memory["history"] = history[-50:]
+
+    # Clean up daily summaries older than 30 days
+    summaries = memory.get("daily_summaries", {})
+    if len(summaries) > 30:
+        # Keep only 30 most recent days
+        sorted_days = sorted(summaries.keys())
+        for old_day in sorted_days[:-30]:
+            del summaries[old_day]
+
+
+def _compress_to_daily(memory, entries):
+    """Compress history entries into daily summaries."""
+    summaries = memory.setdefault("daily_summaries", {})
+    for entry in entries:
+        # Extract date from entry like "[02/28 11:25] 老板: ..."
+        match = re.match(r'\[(\d{2}/\d{2})', entry)
+        if match:
+            day = match.group(1)
+        else:
+            day = time.strftime("%m/%d")
+
+        if day not in summaries:
+            summaries[day] = {"topics": [], "count": 0}
+        # Extract the short topic (user's message part)
+        topic_match = re.search(r'老板: (.+?) →', entry)
+        if topic_match:
+            topic = topic_match.group(1).strip()[:40]
+            # Avoid duplicate topics
+            if topic not in summaries[day]["topics"]:
+                summaries[day]["topics"].append(topic)
+                # Keep max 10 topics per day
+                summaries[day]["topics"] = summaries[day]["topics"][-10:]
+        summaries[day]["count"] += 1
 
 
 # ─── Claude Code ─────────────────────────────────────────────────
@@ -366,11 +412,34 @@ def run_claude(prompt, memory, continue_session=True):
     cwd = memory.get("cwd", DEFAULT_CWD)
     system_prompt = load_system_prompt()
 
-    # Prepend recent conversation history for context
+    # Build context from tiered memory
+    context_parts = []
+
+    # Layer 1: Daily summaries (older context, last 7 days)
+    daily = memory.get("daily_summaries", {})
+    if daily:
+        today = time.strftime("%m/%d")
+        recent_days = sorted(daily.keys())[-7:]  # Last 7 days
+        day_lines = []
+        for day in recent_days:
+            if day == today:
+                continue  # Today's details are in history already
+            info = daily[day]
+            topics = "、".join(info["topics"][:5])
+            day_lines.append(f"  {day}: 聊了{info['count']}条 — {topics}")
+        if day_lines:
+            context_parts.append("[过去几天的对话摘要]\n" + "\n".join(day_lines))
+
+    # Layer 2: Recent detailed history (last 10 messages)
     history = memory.get("history", [])
     if history:
-        recent = "\n".join(history[-5:])
-        prompt = f"[最近对话记录]\n{recent}\n\n[当前消息]\n{prompt}"
+        recent = "\n".join(history[-10:])
+        context_parts.append(f"[最近对话记录]\n{recent}")
+
+    # Combine context with current message
+    if context_parts:
+        context = "\n\n".join(context_parts)
+        prompt = f"{context}\n\n[当前消息]\n{prompt}"
 
     # Build command
     cmd = [CLAUDE_CMD]
