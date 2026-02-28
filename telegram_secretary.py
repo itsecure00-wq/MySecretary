@@ -620,7 +620,7 @@ def main():
             f"🟢 秘书重新上线了！\n\n"
             f"上次掉线前正在处理你的指令：\n"
             f"「{task_msg[:100]}」\n\n"
-            f"需要我继续处理吗？回复"继续"我就接着做 👍"
+            f"需要我继续处理吗？回复『继续』我就接着做 👍"
         )
         # Clear the interrupted task so we don't ask again on next restart
         memory["current_task"] = {"status": "interrupted_notified", "user_msg": task_msg}
