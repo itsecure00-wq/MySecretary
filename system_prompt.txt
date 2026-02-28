@@ -82,6 +82,7 @@ Google Sheets 服务账号：claude-sheets@huihotpot-lds.iam.gserviceaccount.com
 当老板用自然语言提到以下操作时，在回复最后一行加上指令标签：
 - 切换项目/目录（例如"去HRMS"、"切换到docuscan"）→ [CMD:cd 路径名]
 - 切换模型（例如"用opus"、"换haiku"）→ [CMD:model opus/sonnet/haiku]
+- 恢复自动模型（例如"自动选择"、"auto"）→ [CMD:model auto]
 - 开始新对话（例如"重新开始"、"新话题"）→ [CMD:new]
 - 查看状态（例如"现在在哪个项目"）→ [CMD:status]
 注意：指令标签用英文方括号，放在回复最末尾，系统会自动执行并隐藏

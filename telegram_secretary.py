@@ -398,6 +398,68 @@ def _compress_to_daily(memory, entries):
         summaries[day]["count"] += 1
 
 
+# ─── Smart Model Selection ───────────────────────────────────────
+def auto_select_model(text, memory):
+    """Automatically select the best model based on task complexity.
+    Returns (model_name, reason).
+    If user manually set a model via /model command, respect that (manual_model flag).
+    """
+    # If user manually locked a model, respect it
+    if memory.get("manual_model"):
+        m = memory.get("current_model", DEFAULT_MODEL)
+        return m, "manual"
+
+    text_lower = text.lower().strip()
+    text_len = len(text_lower)
+
+    # ── HAIKU: simple greetings, short casual chat ──
+    haiku_greetings = [
+        "你好", "早安", "午安", "晚安", "嗨", "hi", "hello", "hey",
+        "谢谢", "好的", "ok", "收到", "嗯", "哦", "了解",
+        "在吗", "在不在", "忙吗", "干嘛", "做什么",
+    ]
+    for g in haiku_greetings:
+        if text_lower == g or (text_len < 8 and g in text_lower):
+            return "haiku", "simple_chat"
+
+    # Very short messages with no action keywords → haiku
+    if text_len < 6 and not any(w in text_lower for w in ["查", "改", "做", "帮", "看", "写", "修"]):
+        return "haiku", "very_short"
+
+    # ── OPUS: complex tasks needing deep reasoning ──
+    opus_keywords = [
+        # Architecture & design
+        "架构", "设计方案", "技术选型", "重构",
+        # Deep analysis
+        "分析一下", "详细分析", "深入分析", "全面检查", "诊断",
+        # Planning & strategy
+        "规划", "方案", "策略", "计划", "建议怎么",
+        # Complex debugging
+        "一直报错", "找不到原因", "不知道为什么", "很奇怪",
+        # Multi-step / complex
+        "整个系统", "所有项目", "全部", "从头到尾", "完整",
+        # Code review
+        "review", "代码审查", "代码质量", "优化整个",
+        # Business logic
+        "商业", "业务逻辑", "流程设计",
+    ]
+    for kw in opus_keywords:
+        if kw in text_lower:
+            return "opus", "complex_task"
+
+    # Long messages (likely complex request) → opus
+    if text_len > 200:
+        return "opus", "long_request"
+
+    # Messages with multiple questions/tasks → opus
+    question_marks = text.count("?") + text.count("？")
+    if question_marks >= 3:
+        return "opus", "multi_question"
+
+    # ── SONNET: everything else (balanced default) ──
+    return "sonnet", "default"
+
+
 # ─── Claude Code ─────────────────────────────────────────────────
 def load_system_prompt():
     """Load system prompt from file."""
@@ -408,7 +470,8 @@ def load_system_prompt():
 
 def run_claude(prompt, memory, continue_session=True):
     """Run claude CLI and return the response text."""
-    model = memory.get("current_model", DEFAULT_MODEL)
+    # Auto-select model based on task complexity
+    model, reason = auto_select_model(prompt, memory)
     cwd = memory.get("cwd", DEFAULT_CWD)
     system_prompt = load_system_prompt()
 
@@ -454,7 +517,7 @@ def run_claude(prompt, memory, continue_session=True):
         "--append-system-prompt", system_prompt,
     ]
 
-    log(f"Running: claude -p (model={model}, cwd={cwd})")
+    log(f"Running: claude -p (model={model} [{reason}], cwd={cwd})")
 
     try:
         # Remove CLAUDECODE env var to avoid "nested session" error
@@ -528,10 +591,15 @@ def handle_command(text, memory):
 
     if text.startswith("/model "):
         model = text[7:].strip().lower()
+        if model == "auto":
+            memory["manual_model"] = False
+            memory["current_model"] = DEFAULT_MODEL
+            return "🧠 已切换到自动模式，秘书会根据任务自动选择模型", True
         if model in ("opus", "sonnet", "haiku"):
             memory["current_model"] = model
-            return f"🧠 模型已切换到 {model}", True
-        return "❌ 可选模型：opus / sonnet / haiku", False
+            memory["manual_model"] = True
+            return f"🧠 模型已锁定为 {model}（说「用auto」可恢复自动选择）", True
+        return "❌ 可选模型：opus / sonnet / haiku / auto", False
 
     if text == "/stop":
         return "__STOP__", False
