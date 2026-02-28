@@ -95,6 +95,21 @@ def tg_api(method, params=None):
         return {"ok": False, "error": str(e)}
 
 
+def clean_response(text):
+    """Remove internal context headers that may leak into Claude's response."""
+    # Strip context headers that were injected into the prompt
+    headers = [
+        r'\[最近对话记录\].*?(?=\[当前消息\]|\Z)',
+        r'\[过去几天的对话摘要\].*?(?=\[当前消息\]|\Z)',
+        r'\[当前消息\]\s*',
+    ]
+    for pattern in headers:
+        text = re.sub(pattern, '', text, flags=re.DOTALL)
+    # Also strip any leading [tag] lines that look like injected context
+    text = re.sub(r'^\[\S+?\]\n', '', text, flags=re.MULTILINE)
+    return text.strip()
+
+
 def clean_markdown(text):
     """Strip markdown formatting from Claude's response for clean Telegram display."""
     # Remove markdown headers (# ## ### etc.)
@@ -126,7 +141,8 @@ def clean_markdown(text):
 def send_msg(text, chat_id=None):
     """Send message to Telegram, auto-splitting long messages."""
     cid = chat_id or CHAT_ID
-    # Clean markdown formatting before sending
+    # Strip leaked context headers, then clean markdown
+    text = clean_response(text)
     text = clean_markdown(text)
     # Telegram limit is 4096 chars
     chunks = split_message(text, 4000)
