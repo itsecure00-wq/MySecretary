@@ -95,16 +95,45 @@ def tg_api(method, params=None):
         return {"ok": False, "error": str(e)}
 
 
+def clean_markdown(text):
+    """Strip markdown formatting from Claude's response for clean Telegram display."""
+    # Remove markdown headers (# ## ### etc.)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove bold **text** or __text__
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    # Remove italic *text* or _text_ (single)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', text)
+    # Remove code blocks ```...```
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    # Remove inline code `text`
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Remove markdown links [text](url) → text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # Remove markdown table formatting (|---|---|)
+    text = re.sub(r'^\|[-:\s|]+\|$', '', text, flags=re.MULTILINE)
+    # Remove table row pipes: | cell | cell | → cell  cell
+    text = re.sub(r'^\|\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*\|$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*\|\s*', '  ', text)
+    # Remove horizontal rules (--- or ***)
+    text = re.sub(r'^[\-\*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    # Clean up excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def send_msg(text, chat_id=None):
     """Send message to Telegram, auto-splitting long messages."""
     cid = chat_id or CHAT_ID
+    # Clean markdown formatting before sending
+    text = clean_markdown(text)
     # Telegram limit is 4096 chars
     chunks = split_message(text, 4000)
     for chunk in chunks:
         tg_api("sendMessage", {
             "chat_id": cid,
             "text": chunk,
-            "parse_mode": "HTML"
         })
         if len(chunks) > 1:
             time.sleep(0.5)  # avoid rate limit
@@ -607,6 +636,8 @@ def main():
                     continue
 
                 # Normal message → send to Claude Code
+                # Immediately acknowledge receipt so user knows we're working
+                send_msg("收到～正在处理中，稍等一下 ⏳")
                 typing.start()
                 try:
                     response = run_claude(text, memory, continue_session)
