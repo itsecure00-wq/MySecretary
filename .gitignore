@@ -1,3 +1,35 @@
 .env
 *.pyc
 __pycache__/
+
+# Screenshots and temp files
+*.png
+*.jpg
+_stderr_temp.txt
+crash_log.txt
+heal_state.json
+desktop_*.png
+desktop_now.png
+menu_screen.png
+admin_*.png
+
+# Debug/temp scripts
+find_*.py
+fix_*.py
+get_*.py
+get_pospal_menu.py
+pospal_session.py
+paste_console.ps1
+extract_menu.ps1
+get_menu.ps1
+probe*.py
+scroll_*.ps1
+read_clip.ps1
+
+# Received files from Telegram
+received_files/
+
+# Generated data
+menu_data.txt
+morning_report_*.md
+scheduled_tasks.json
