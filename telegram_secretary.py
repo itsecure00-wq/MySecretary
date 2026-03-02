@@ -1099,6 +1099,19 @@ def main():
     reporter.start()
     log("Daily reporter started — will send at 10:00 & 22:00 daily")
 
+    # Auto backup memory on startup
+    try:
+        import importlib.util
+        backup_script = SCRIPT_DIR / "backup_memory.py"
+        if backup_script.exists():
+            spec = importlib.util.spec_from_file_location("backup_memory", backup_script)
+            bm = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(bm)
+            bm.backup_memory()
+            log("Memory backup completed on startup")
+    except Exception as e:
+        log(f"Memory backup failed (non-critical): {e}")
+
     typing = TypingIndicator()
     offset = 0
     continue_session = False
