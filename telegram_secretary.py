@@ -94,6 +94,11 @@ HEAL_COOLDOWN_SEC = 300     # 5 minutes between fix attempts
 HEAL_CLI_TIMEOUT = 120      # 2 minutes max for Claude CLI fix
 CONSECUTIVE_ERROR_LIMIT = 5 # Trigger safe mode after this many
 
+# ─── Watchdog Files ──────────────────────────────────────────────
+PID_FILE = SCRIPT_DIR / "bot.pid"
+HEARTBEAT_FILE = SCRIPT_DIR / "bot_heartbeat.txt"
+HEARTBEAT_INTERVAL_SEC = 30  # daemon thread updates this often
+
 # ─── Daily Report Configuration ──────────────────────────────────
 # Send auto-report at 10:00 AM and 10:00 PM every day
 REPORT_HOURS = {10, 22}   # 24-hour format
@@ -660,6 +665,43 @@ def self_heal():
     log(f"Self-heal: {'SUCCESS' if success else 'FAILED'} — {summary[:100]}")
 
 
+# ─── Watchdog Heartbeat ──────────────────────────────────────────
+def write_pid():
+    """Write current process PID for watchdog to track."""
+    try:
+        PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception as e:
+        log(f"write_pid failed: {e}")
+
+
+def update_heartbeat():
+    """Touch the heartbeat file. Watchdog checks this to detect hangs."""
+    try:
+        HEARTBEAT_FILE.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass  # never let heartbeat failures crash the bot
+
+
+def cleanup_watchdog_files():
+    """Remove PID and heartbeat files on clean shutdown."""
+    for f in (PID_FILE, HEARTBEAT_FILE):
+        try:
+            if f.exists():
+                f.unlink()
+        except Exception:
+            pass
+
+
+def heartbeat_loop():
+    """Daemon thread: refresh heartbeat every HEARTBEAT_INTERVAL_SEC.
+    If the Python interpreter is alive enough to schedule this thread,
+    the heartbeat keeps ticking. If GIL is permanently stuck (native hang)
+    the heartbeat goes stale and the watchdog kills us."""
+    while True:
+        update_heartbeat()
+        time.sleep(HEARTBEAT_INTERVAL_SEC)
+
+
 # ─── Memory ──────────────────────────────────────────────────────
 def load_memory():
     """Load memory from JSON file."""
@@ -1064,7 +1106,16 @@ def main():
     log(f"Chat ID: {CHAT_ID}")
     log(f"Voice support: {'ENABLED' if VOICE_ENABLED else 'DISABLED'}")
     log(f"FFmpeg: {FFMPEG_PATH}")
+    log(f"PID: {os.getpid()}")
     log("=" * 50)
+
+    # Watchdog: write PID, start heartbeat thread, clean up on exit
+    write_pid()
+    update_heartbeat()
+    import atexit
+    atexit.register(cleanup_watchdog_files)
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    log(f"Heartbeat thread started (interval={HEARTBEAT_INTERVAL_SEC}s)")
 
     # ── Self-heal: check for previous crash and attempt auto-fix ──
     try:

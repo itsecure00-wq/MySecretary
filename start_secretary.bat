@@ -24,12 +24,24 @@ echo Chat ID: %TELEGRAM_CHAT_ID%
 echo ==========================================
 echo.
 
+set PYTHON_EXE=C:\Users\Admin23\AppData\Local\Python\pythoncore-3.14-64\python.exe
+
 :loop
 echo [%date% %time%] Starting bot... >> crash_log.txt
 
+REM Clean any stale PID/heartbeat from a previous run so watchdog won't trip immediately
+if exist bot.pid del /F /Q bot.pid
+if exist bot_heartbeat.txt del /F /Q bot_heartbeat.txt
+
+REM Start watchdog in a minimized window — kills bot if it hangs (no heartbeat for 5 min)
+start "AI Secretary Watchdog" /MIN "%PYTHON_EXE%" watchdog.py
+
 REM Run Python with stderr captured to temp file
-"C:\Users\Admin23\AppData\Local\Python\pythoncore-3.14-64\python.exe" telegram_secretary.py 2> _stderr_temp.txt
+"%PYTHON_EXE%" telegram_secretary.py 2> _stderr_temp.txt
 set EXIT_CODE=%ERRORLEVEL%
+
+REM Make sure the watchdog is stopped before we restart the bot
+taskkill /F /FI "WINDOWTITLE eq AI Secretary Watchdog*" /T >nul 2>&1
 
 REM Log crash info to crash_log.txt (structured format)
 echo ===CRASH_START=== >> crash_log.txt
