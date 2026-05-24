@@ -9,7 +9,9 @@ Telegram AI Secretary — 远程遥控 Claude Code
 import hashlib
 import json
 import os
+import queue
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -42,6 +44,13 @@ try:
 except ImportError:
     VOICE_ENABLED = False
 
+# Groq Whisper (高精度语音识别)
+try:
+    from groq import Groq as GroqClient
+    GROQ_ENABLED = True
+except ImportError:
+    GROQ_ENABLED = False
+
 # SSL: use certifi CA bundle for proper certificate verification
 import certifi
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
@@ -49,26 +58,28 @@ SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 # ─── Configuration ───────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GCFB_GROUP_CHAT_ID = os.environ.get("GCFB_GROUP_CHAT_ID", "")  # GCFB CUSTOMER SERVICE 群
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 BOSS_USER_ID = CHAT_ID  # 老板的 user_id 等于私聊 chat_id
 SCRIPT_DIR = Path(__file__).parent
 MEMORY_FILE = SCRIPT_DIR / "memory.json"
 SYSTEM_PROMPT_FILE = SCRIPT_DIR / "system_prompt.txt"
+MAILBOX_FILE = SCRIPT_DIR.parent / "bot_mailbox.json"  # 小花↔小虾 共享留言板
 CLAUDE_TIMEOUT = 600  # 10 minutes max per command
-MAX_TURNS = 100
+MAX_TURNS_HAIKU = 5    # simple chat
+MAX_TURNS_SONNET = 50  # coding/general tasks
+MAX_TURNS_OPUS = 75    # complex tasks
 DEFAULT_MODEL = "sonnet"
 DEFAULT_CWD = os.environ.get(
     "SECRETARY_CWD",
     str(Path.home() / "Documents" / "cluade code")
 )
-# Call node.exe + cli.js directly to bypass cmd.exe newline truncation bug
-NODE_EXE = os.environ.get(
-    "NODE_EXE",
-    r"C:\Users\Admin23\nodejs\node.exe"
-)
-CLAUDE_CLI_JS = os.environ.get(
-    "CLAUDE_CLI_JS",
-    r"C:\Users\Admin23\nodejs\node_modules\@anthropic-ai\claude-code\cli.js"
+# Claude Code v2.1+ uses compiled binary (claude.exe) instead of Node.js cli.js
+CLAUDE_EXE = os.environ.get(
+    "CLAUDE_EXE",
+    r"C:\Users\Admin23\nodejs\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
 )
 
 # ffmpeg path for voice conversion
@@ -86,9 +97,25 @@ if VOICE_ENABLED:
 RECEIVED_DIR = SCRIPT_DIR / "received_files"
 RECEIVED_DIR.mkdir(exist_ok=True)
 
+
+def _clean_received_files(max_age_days=7):
+    """Delete files in received_files/ older than max_age_days. Called on startup."""
+    try:
+        cutoff = time.time() - (max_age_days * 86400)
+        count = 0
+        for f in RECEIVED_DIR.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                count += 1
+        if count:
+            log(f"🧹 Cleaned {count} old file(s) from received_files/")
+    except Exception as e:
+        log(f"Clean received_files error (non-critical): {e}")
+
 # ─── Self-Heal Configuration ────────────────────────────────────
 CRASH_LOG_FILE = SCRIPT_DIR / "crash_log.txt"
 HEAL_STATE_FILE = SCRIPT_DIR / "heal_state.json"
+HEAL_BACKUP_FILE = SCRIPT_DIR / "telegram_secretary.py.heal_backup"
 MAX_HEAL_ATTEMPTS = 3       # Max fix attempts per unique error
 HEAL_COOLDOWN_SEC = 300     # 5 minutes between fix attempts
 HEAL_CLI_TIMEOUT = 120      # 2 minutes max for Claude CLI fix
@@ -109,6 +136,34 @@ SS_PATH = str(SCRIPT_DIR / "desktop_now.png")
 SS_SCRIPT = r"C:\Users\Admin23\AppData\Local\Temp\ss.ps1"
 
 
+# ─── OAuth Token Note ────────────────────────────────────────────
+# Claude Code v2.1+ uses OAuth tokens. The binary handles refresh
+# internally (in-memory) even with expired tokens on disk. No need
+# for proactive refresh — just robust retry with backoff on 401.
+
+
+# ─── Parallel Task Queue ─────────────────────────────────────────
+_task_queue = queue.Queue()
+_task_counter_lock = threading.Lock()
+_task_counter = [0]
+_memory_lock = threading.Lock()  # Protects memory dict + save_memory() across threads
+_current_proc = None             # Current Claude subprocess (for /cancel)
+_current_proc_lock = threading.Lock()
+_worker_thread = None            # Reference for watchdog
+_last_auth_warn_ts = 0           # Cooldown for auth-error Telegram messages
+_last_network_warn_ts = 0        # Cooldown for network-outage Telegram messages
+
+
+def _next_task_code():
+    """Generate A, B, C... Z, A1, B1... task codes."""
+    with _task_counter_lock:
+        n = _task_counter[0]
+        _task_counter[0] += 1
+    if n < 26:
+        return chr(ord('A') + n)
+    return chr(ord('A') + (n % 26)) + str(n // 26 + 1)
+
+
 # ─── Telegram API ────────────────────────────────────────────────
 def tg_api(method, params=None, retries=2):
     """Call Telegram Bot API with retry on network errors."""
@@ -123,10 +178,10 @@ def tg_api(method, params=None, retries=2):
             with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception as e:
-            log(f"Telegram API error ({method}, attempt {attempt}/{retries}): {e}")
             if attempt < retries:
                 time.sleep(3)
             else:
+                log(f"Telegram API error ({method}, {retries} attempts failed): {e}")
                 return {"ok": False, "error": str(e)}
 
 
@@ -196,6 +251,44 @@ def send_msg(text, chat_id=None):
         })
         if len(chunks) > 1:
             time.sleep(0.5)  # avoid rate limit
+
+
+def send_photo(file_path, caption=""):
+    """Send an image file as inline photo via Telegram sendPhoto."""
+    file_path = str(file_path)
+    if not os.path.isfile(file_path):
+        log(f"send_photo: file not found: {file_path}")
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    boundary = "----SecretaryPhotoBoundary"
+    file_name = os.path.basename(file_path)
+    try:
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+        body = b""
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{CHAT_ID}\r\n'.encode()
+        if caption:
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode()
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="photo"; filename="{file_name}"\r\n'.encode()
+        body += b"Content-Type: image/jpeg\r\n\r\n"
+        body += file_data
+        body += f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(url, data=body)
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+            if resp.get("ok"):
+                log(f"Photo sent: {file_name}")
+                return True
+            else:
+                log(f"send_photo failed: {resp}")
+                return send_file(file_path, caption)  # fallback to document
+    except Exception as e:
+        log(f"send_photo error: {e}")
+        return False
 
 
 def send_file(file_path, caption=""):
@@ -269,14 +362,16 @@ class TypingIndicator:
     def __init__(self):
         self._running = False
         self._thread = None
+        self._chat_id = CHAT_ID
 
-    def start(self):
+    def start(self, chat_id=None):
+        self._chat_id = chat_id or CHAT_ID
         self._running = True
         self._send_loop()
 
     def _send_loop(self):
         if self._running:
-            tg_api("sendChatAction", {"chat_id": CHAT_ID, "action": "typing"})
+            tg_api("sendChatAction", {"chat_id": self._chat_id, "action": "typing"})
             self._thread = threading.Timer(4.0, self._send_loop)
             self._thread.daemon = True
             self._thread.start()
@@ -367,43 +462,88 @@ def _recognize_with_timeout(recognizer, audio_data, lang, timeout=30):
     return result[0]
 
 
-def transcribe_voice(ogg_path):
-    """Convert OGG voice to text. Tries Chinese first, then English."""
+def _transcribe_with_groq(ogg_path):
+    """Use Groq Whisper-large-v3 for transcription. Handles Chinese + English + Malay mixed."""
+    if not GROQ_ENABLED or not GROQ_API_KEY:
+        return None
+    try:
+        client = GroqClient(api_key=GROQ_API_KEY)
+        with open(ogg_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                file=(os.path.basename(ogg_path), f.read()),
+                model="whisper-large-v3",
+                response_format="text",
+                language=None,  # auto-detect: handles Chinese/English/Malay mix
+            )
+        text = str(result).strip() if result else ""
+        if text:
+            log(f"Groq Whisper recognized: {text[:80]}...")
+        return text or None
+    except Exception as e:
+        log(f"Groq transcription error: {e}")
+        return None
+
+
+def _transcribe_with_google(ogg_path):
+    """Fallback: Google Speech Recognition (free, less accurate)."""
     if not VOICE_ENABLED:
         return None
     wav_path = ogg_path.replace(".ogg", ".wav")
     try:
-        # Convert OGG → WAV using pydub + ffmpeg
-        log("Converting OGG → WAV...")
         audio = AudioSegment.from_ogg(ogg_path)
         audio.export(wav_path, format="wav")
-        log("WAV conversion done, starting recognition...")
-
-        # Recognize speech — try Chinese first, then English
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-
         for lang in ["zh-CN", "en-US"]:
             text = _recognize_with_timeout(recognizer, audio_data, lang, timeout=30)
             if text:
-                log(f"Voice recognized ({lang}): {text[:60]}...")
+                log(f"Google STT recognized ({lang}): {text[:60]}...")
                 return text
-        log("Voice not recognized in any language")
         return None
     except Exception as e:
-        log(f"Transcription error: {e}")
+        log(f"Google STT error: {e}")
         return None
     finally:
-        # Cleanup temp files
-        for f in [ogg_path, wav_path]:
-            try:
-                os.unlink(f)
-            except Exception:
-                pass
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
 
 
-# ─── Self-Heal System ────────────────────────────────────────────
+def transcribe_voice(ogg_path):
+    """Convert OGG voice to text. Uses Groq Whisper first, falls back to Google STT."""
+    try:
+        # 优先用 Groq Whisper (高精度，支持华语/英语/马来语混合)
+        text = _transcribe_with_groq(ogg_path)
+        if text:
+            return text
+        # 备用: Google Speech Recognition
+        log("Groq failed or unavailable, trying Google STT...")
+        text = _transcribe_with_google(ogg_path)
+        return text
+    finally:
+        # 清理原始 OGG 文件
+        try:
+            os.unlink(ogg_path)
+        except Exception:
+            pass
+
+
+# ─── Self-Heal System (v2) ──────────────────────────────────────
+#
+# Error Classification:
+#   🔧 CODE_BUG   — SyntaxError, NameError, TypeError, etc. → Claude fixes code
+#   📦 MISSING_DEP — ImportError, ModuleNotFoundError → auto pip install
+#   🌐 ENVIRONMENT — 401 auth, timeout, network, config → retry + notify boss
+#   💾 RESOURCE    — disk full, MemoryError → cleanup + notify boss
+#
+# Safety Net:
+#   1. Backup before any fix
+#   2. py_compile check after fix
+#   3. import test after fix
+#   4. Rollback if fix breaks things
+
 def load_heal_state():
     """Load heal state tracking from JSON file."""
     if HEAL_STATE_FILE.exists():
@@ -416,6 +556,17 @@ def load_heal_state():
 
 def save_heal_state(state):
     """Save heal state tracking to JSON file."""
+    # Clean up entries older than 7 days
+    errors = state.get("errors", {})
+    cutoff = (datetime.now().timestamp()) - (7 * 86400)
+    for sig in list(errors.keys()):
+        last = errors[sig].get("last_attempt", "")
+        if last:
+            try:
+                if datetime.fromisoformat(last).timestamp() < cutoff:
+                    del errors[sig]
+            except Exception:
+                pass
     HEAL_STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8"
@@ -423,20 +574,51 @@ def save_heal_state(state):
 
 
 def get_error_signature(stderr_text):
-    """Generate a normalized signature for an error to track unique errors.
-    Strips line numbers, timestamps, and other variable parts."""
+    """Generate a normalized signature for an error to track unique errors."""
     if not stderr_text:
         return "empty_error"
-    # Normalize: remove line numbers, timestamps, memory addresses, PIDs
     normalized = re.sub(r'line \d+', 'line N', stderr_text)
     normalized = re.sub(r'\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}', 'TIMESTAMP', normalized)
     normalized = re.sub(r'\d{2}/\d{2}/\d{4}', 'DATE', normalized)
     normalized = re.sub(r'\d{2}:\d{2}:\d{2}', 'TIME', normalized)
     normalized = re.sub(r'0x[0-9a-fA-F]+', '0xADDR', normalized)
     normalized = re.sub(r'PID\s*\d+', 'PID N', normalized)
-    # Take only the last meaningful error lines (last 500 chars)
     normalized = normalized.strip()[-500:]
     return hashlib.md5(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+def classify_error(stderr_text):
+    """Classify error into categories. Returns (category, detail).
+    Categories: 'code_bug', 'missing_dep', 'environment', 'resource'."""
+    if not stderr_text:
+        return "environment", "empty stderr"
+
+    lower = stderr_text.lower()
+
+    # 📦 Missing dependency — can auto-fix with pip install
+    dep_match = re.search(r"(?:ModuleNotFoundError|ImportError).*?['\"](\S+?)['\"]", stderr_text)
+    if dep_match or "no module named" in lower:
+        module_name = dep_match.group(1) if dep_match else "unknown"
+        return "missing_dep", module_name
+
+    # 💾 Resource issues — cleanup, don't fix code
+    if any(kw in lower for kw in ["memoryerror", "out of memory", "no space left",
+                                    "disk full", "errno 28", "errno 12"]):
+        return "resource", "system resource exhaustion"
+
+    # 🌐 Environment / network / auth — retry, don't fix code
+    env_keywords = [
+        "authentication_error", "401", "403", "connectionerror", "timeout",
+        "econnreset", "econnrefused", "etimedout", "enotfound",
+        "socket hang up", "network", "ssl", "certificate",
+        "rate limit", "429", "529", "overloaded",
+        "permission denied", "access denied",
+    ]
+    if any(kw in lower for kw in env_keywords):
+        return "environment", next(kw for kw in env_keywords if kw in lower)
+
+    # 🔧 Code bug — everything else (SyntaxError, NameError, TypeError, etc.)
+    return "code_bug", stderr_text.strip().split('\n')[-1][:100]
 
 
 def can_attempt_heal(signature, state):
@@ -447,12 +629,10 @@ def can_attempt_heal(signature, state):
     info = errors[signature]
     if info.get("count", 0) >= MAX_HEAL_ATTEMPTS:
         return False
-    # Check cooldown
     last = info.get("last_attempt", "")
     if last:
         try:
-            last_time = datetime.fromisoformat(last)
-            elapsed = (datetime.now() - last_time).total_seconds()
+            elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds()
             if elapsed < HEAL_COOLDOWN_SEC:
                 return False
         except Exception:
@@ -461,8 +641,7 @@ def can_attempt_heal(signature, state):
 
 
 def parse_crash_log():
-    """Parse crash_log.txt and extract the most recent crash info.
-    Returns dict with 'exit_code', 'stderr', 'timestamp' or None if no crash."""
+    """Parse crash_log.txt and extract the most recent crash info."""
     if not CRASH_LOG_FILE.exists():
         return None
     try:
@@ -473,57 +652,138 @@ def parse_crash_log():
     if "===CRASH_START===" not in content:
         return None
 
-    # Find the last crash block
     blocks = content.split("===CRASH_START===")
     if len(blocks) < 2:
         return None
     last_block = blocks[-1]
-    # Extract fields
     crash_info = {"exit_code": "unknown", "stderr": "", "timestamp": ""}
 
     ts_match = re.search(r'timestamp=(.+)', last_block)
     if ts_match:
         crash_info["timestamp"] = ts_match.group(1).strip()
-
     ec_match = re.search(r'exit_code=(\S+)', last_block)
     if ec_match:
         crash_info["exit_code"] = ec_match.group(1).strip()
-
-    # Extract stderr (everything between "--- stderr ---" and "===CRASH_END===")
     stderr_match = re.search(r'--- stderr ---\s*\n(.*?)(?:===CRASH_END===|\Z)', last_block, re.DOTALL)
     if stderr_match:
         crash_info["stderr"] = stderr_match.group(1).strip()
 
-    # Skip clean kills (exit_code=-1 with no stderr = process was killed manually)
+    # Skip clean kills
     if crash_info["exit_code"] == "-1" and not crash_info["stderr"]:
         return None
-
-    # Only return if there's actual error content
     if crash_info["stderr"] or crash_info["exit_code"] not in ("0", "unknown"):
         return crash_info
     return None
 
 
-def attempt_fix(crash_info):
-    """Call Claude CLI to analyze and fix the crash error.
-    Returns (success: bool, summary: str)."""
-    stderr_snippet = crash_info["stderr"][:2000]  # Limit context size
+# ─── Safety Net: backup / verify / rollback ─────────────────────
+def _backup_bot_file():
+    """Create backup before any fix attempt."""
+    bot_file = SCRIPT_DIR / "telegram_secretary.py"
+    try:
+        shutil.copy2(bot_file, HEAL_BACKUP_FILE)
+        log(f"Self-heal: Backup created → {HEAL_BACKUP_FILE.name}")
+        return True
+    except Exception as e:
+        log(f"Self-heal: Backup failed: {e}")
+        return False
+
+
+def _verify_bot_file():
+    """Verify bot file after fix: syntax check + import test.
+    Returns (ok: bool, error: str)."""
+    bot_file = str(SCRIPT_DIR / "telegram_secretary.py")
+    # 1) Syntax check
+    try:
+        import py_compile
+        py_compile.compile(bot_file, doraise=True)
+    except py_compile.PyCompileError as e:
+        return False, f"语法错误: {e}"
+
+    # 2) Import test (load as module, check main symbols exist)
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_heal_test", bot_file)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Check critical functions exist
+        for name in ["main", "run_claude", "send_msg", "task_worker", "load_memory"]:
+            if not hasattr(mod, name):
+                return False, f"关键函数 {name} 丢失"
+    except Exception as e:
+        return False, f"导入测试失败: {str(e)[:200]}"
+
+    return True, "OK"
+
+
+def _rollback_bot_file():
+    """Restore bot file from backup."""
+    bot_file = SCRIPT_DIR / "telegram_secretary.py"
+    if HEAL_BACKUP_FILE.exists():
+        try:
+            shutil.copy2(HEAL_BACKUP_FILE, bot_file)
+            log("Self-heal: ROLLED BACK to backup")
+            return True
+        except Exception as e:
+            log(f"Self-heal: Rollback failed: {e}")
+    return False
+
+
+# ─── Fix Handlers per Category ──────────────────────────────────
+def _fix_missing_dep(module_name):
+    """Auto-install missing Python package. Returns (success, summary)."""
+    # Map common module names to pip package names
+    pip_map = {
+        "cv2": "opencv-python",
+        "PIL": "Pillow",
+        "sklearn": "scikit-learn",
+        "yaml": "pyyaml",
+        "bs4": "beautifulsoup4",
+    }
+    pkg = pip_map.get(module_name, module_name)
+    log(f"Self-heal: Auto-installing missing package: {pkg}")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", pkg],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace"
+        )
+        if result.returncode == 0:
+            return True, f"自动安装了 {pkg}"
+        return False, f"pip install {pkg} 失败: {result.stderr[:200]}"
+    except Exception as e:
+        return False, f"安装出错: {str(e)[:200]}"
+
+
+def _fix_code_bug(crash_info):
+    """Call Claude CLI to fix a code bug. Returns (success, summary).
+    Includes safety net: backup → fix → verify → rollback if broken."""
+    # Step 1: Backup
+    if not _backup_bot_file():
+        return False, "无法创建备份，放弃修复"
+
+    # Step 2: Call Claude to fix
+    stderr_snippet = crash_info["stderr"][:2000]
     bot_file = os.path.abspath(str(SCRIPT_DIR / "telegram_secretary.py"))
 
     prompt = (
-        f"你是 Telegram 秘书机器人的维修工。\n"
+        f"你是 Telegram 秘书机器人（小花）的维修工。\n"
+        f"这个机器人是一个 2000+ 行的 Python 文件，通过 Telegram Bot API 接收消息，"
+        f"调用 Claude Code CLI 处理任务，有语音转文字、图片处理、自动汇报等功能。\n\n"
         f"上次运行崩溃了，错误信息如下：\n\n"
         f"退出码: {crash_info['exit_code']}\n"
         f"错误输出:\n{stderr_snippet}\n\n"
-        f"请分析错误原因，然后直接修复文件:\n{bot_file}\n\n"
-        f"注意：\n"
+        f"请分析错误原因，然后直接修复文件: {bot_file}\n\n"
+        f"重要规则：\n"
         f"- 只修复导致崩溃的问题，不要改其他功能\n"
         f"- 不要删除任何现有功能\n"
+        f"- 不要改变函数签名（参数）\n"
+        f"- 确保修复后代码语法正确\n"
         f"- 修复后简要说明改了什么"
     )
 
     cmd = [
-        NODE_EXE, CLAUDE_CLI_JS,
+        CLAUDE_EXE,
         "-p", prompt,
         "--output-format", "text",
         "--model", "sonnet",
@@ -534,39 +794,40 @@ def attempt_fix(crash_info):
     try:
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
-
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)  # let claude.exe use credentials.json (auto-refreshed)
         result = subprocess.run(
-            cmd,
-            cwd=str(SCRIPT_DIR),
-            capture_output=True,
-            text=True,
-            timeout=HEAL_CLI_TIMEOUT,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            env=env,
+            cmd, cwd=str(SCRIPT_DIR),
+            capture_output=True, text=True, timeout=HEAL_CLI_TIMEOUT,
+            encoding="utf-8", errors="replace", shell=False, env=env,
         )
         output = result.stdout.strip()
-        if result.returncode == 0 and output:
-            # Extract a short summary (first 300 chars)
-            summary = output[:300]
-            return True, summary
-        else:
+        if result.returncode != 0 or not output:
             err = result.stderr.strip()[:200] if result.stderr else "no output"
-            return False, f"CLI returned code {result.returncode}: {err}"
+            _rollback_bot_file()
+            return False, f"Claude CLI 返回错误: {err}"
     except subprocess.TimeoutExpired:
+        _rollback_bot_file()
         return False, "修复超时（2分钟）"
     except Exception as e:
+        _rollback_bot_file()
         return False, f"修复出错: {str(e)[:200]}"
+
+    # Step 3: Verify the fix
+    ok, verify_msg = _verify_bot_file()
+    if not ok:
+        log(f"Self-heal: Fix BROKE the code! {verify_msg}")
+        _rollback_bot_file()
+        return False, f"Claude 的修复破坏了代码（{verify_msg}），已回滚"
+
+    summary = output[:300]
+    log(f"Self-heal: Fix verified OK")
+    return True, summary
 
 
 def archive_crash_log():
-    """Clear crash_log.txt after processing (keep last 5 entries as archive)."""
+    """Clear crash_log.txt after processing."""
     try:
         if CRASH_LOG_FILE.exists():
-            content = CRASH_LOG_FILE.read_text(encoding="utf-8", errors="replace")
-            blocks = content.split("===CRASH_START===")
-            # Keep only header lines (non-crash content) for clean slate
             CRASH_LOG_FILE.write_text(
                 f"[Archived at {time.strftime('%Y-%m-%d %H:%M:%S')}]\n",
                 encoding="utf-8",
@@ -588,52 +849,106 @@ def log_error_to_disk(error):
             f.write(f"{tb}\n")
             f.write("===CRASH_END===\n")
     except Exception:
-        pass  # Don't let logging errors crash the bot
+        pass
 
 
 def self_heal():
-    """Main self-heal entry point. Called at startup to check for previous crashes.
-    If a crash is found, reports to user and attempts auto-fix via Claude CLI."""
+    """Main self-heal entry point (v2). Called at startup.
+    Classifies error → picks the right fix strategy → verifies → reports."""
     crash_info = parse_crash_log()
     if not crash_info:
         log("Self-heal: No crash detected, clean startup.")
         return
 
-    stderr_short = crash_info["stderr"][:200] if crash_info["stderr"] else "(no stderr)"
+    stderr_text = crash_info["stderr"]
+    stderr_short = stderr_text[:200] if stderr_text else "(no stderr)"
     log(f"Self-heal: Crash detected! Exit code={crash_info['exit_code']}")
-    log(f"Self-heal: stderr preview: {stderr_short}")
 
-    # Check heal state
-    state = load_heal_state()
-    signature = get_error_signature(crash_info["stderr"])
+    # ── Step 1: Classify the error ──
+    category, detail = classify_error(stderr_text)
+    log(f"Self-heal: Category={category}, Detail={detail[:80]}")
 
-    if not can_attempt_heal(signature, state):
-        # Already tried too many times or in cooldown
-        attempts = state.get("errors", {}).get(signature, {}).get("count", 0)
-        log(f"Self-heal: Skipping fix (signature={signature}, attempts={attempts}/{MAX_HEAL_ATTEMPTS})")
-        # Still report to user
+    # ── Step 2: Handle by category ──
+
+    if category == "environment":
+        # 🌐 Network/auth/config — NOT a code bug, just report
+        log("Self-heal: Environment error — skipping code fix")
         try:
             send_msg(
-                f"老板，上次我崩溃了 (退出码: {crash_info['exit_code']})\n"
+                f"老板，上次出了网络/环境问题（不是代码 bug）\n"
+                f"类型: {detail}\n"
                 f"错误: {stderr_short}\n\n"
-                f"这个错误已经尝试修复{attempts}次了还是不行，需要老板亲自看看 🔧"
+                f"这种问题通常会自己恢复，我继续正常运行 👍"
             )
         except Exception:
             pass
         archive_crash_log()
         return
 
-    # Report and attempt fix
+    if category == "resource":
+        # 💾 Resource — cleanup + report
+        log("Self-heal: Resource error — attempting cleanup")
+        try:
+            _clean_received_files(max_age_days=1)  # Aggressive cleanup
+            _trim_log_file()
+            send_msg(
+                f"老板，上次因为系统资源问题崩溃了\n"
+                f"详情: {detail}\n\n"
+                f"已自动清理缓存文件，继续运行"
+            )
+        except Exception:
+            pass
+        archive_crash_log()
+        return
+
+    if category == "missing_dep":
+        # 📦 Missing dependency — auto pip install
+        log(f"Self-heal: Missing dependency — auto-installing: {detail}")
+        try:
+            send_msg(f"检测到缺少依赖包 {detail}，正在自动安装...")
+        except Exception:
+            pass
+        success, summary = _fix_missing_dep(detail)
+        try:
+            if success:
+                send_msg(f"✅ {summary}，继续正常运行")
+            else:
+                send_msg(f"❌ 依赖安装失败: {summary}\n需要老板手动安装")
+        except Exception:
+            pass
+        archive_crash_log()
+        log(f"Self-heal: dep install {'OK' if success else 'FAIL'} — {summary}")
+        return
+
+    # ── category == "code_bug" ──
+    # 🔧 Code bug — Claude fixes with safety net
+    state = load_heal_state()
+    signature = get_error_signature(stderr_text)
+
+    if not can_attempt_heal(signature, state):
+        attempts = state.get("errors", {}).get(signature, {}).get("count", 0)
+        log(f"Self-heal: Skip fix (sig={signature}, attempts={attempts}/{MAX_HEAL_ATTEMPTS})")
+        try:
+            send_msg(
+                f"老板，这个代码错误修了{attempts}次还是不行\n"
+                f"错误: {stderr_short}\n\n"
+                f"需要你亲自看看 🔧"
+            )
+        except Exception:
+            pass
+        archive_crash_log()
+        return
+
     try:
         send_msg(
-            f"老板，检测到上次崩溃 (退出码: {crash_info['exit_code']})\n"
+            f"检测到代码 bug（{crash_info['exit_code']}）\n"
             f"错误: {stderr_short}\n\n"
-            f"正在尝试自动修复... 🔧"
+            f"正在备份 → 修复 → 验证... 🔧"
         )
     except Exception:
         pass
 
-    success, summary = attempt_fix(crash_info)
+    success, summary = _fix_code_bug(crash_info)
 
     # Update heal state
     errors = state.setdefault("errors", {})
@@ -641,18 +956,18 @@ def self_heal():
         errors[signature] = {
             "count": 0,
             "first_seen": datetime.now().isoformat(),
-            "stderr_snippet": crash_info["stderr"][:100],
+            "stderr_snippet": stderr_text[:100],
         }
     errors[signature]["count"] = errors[signature].get("count", 0) + 1
     errors[signature]["last_attempt"] = datetime.now().isoformat()
+    errors[signature]["last_result"] = "success" if success else "failed"
     save_heal_state(state)
 
-    # Report result
     try:
         if success:
-            send_msg(f"自动修复完成！\n修复内容: {summary[:500]}\n\n我会继续正常运行～")
+            send_msg(f"✅ 自动修复完成（已验证语法+导入）\n修复: {summary[:500]}")
         else:
-            send_msg(f"自动修复失败了: {summary[:300]}\n\n需要老板介入看看 🆘")
+            send_msg(f"❌ 自动修复失败: {summary[:300]}\n代码已回滚到修复前的版本，不会更糟")
     except Exception:
         pass
 
@@ -660,14 +975,113 @@ def self_heal():
     log(f"Self-heal: {'SUCCESS' if success else 'FAILED'} — {summary[:100]}")
 
 
+def run_diagnose():
+    """Run self-diagnostics on demand (called by /diagnose command).
+    Checks: syntax, imports, config, connectivity, disk space."""
+    results = []
+
+    # 1) Syntax check
+    bot_file = str(SCRIPT_DIR / "telegram_secretary.py")
+    try:
+        import py_compile
+        py_compile.compile(bot_file, doraise=True)
+        results.append("✅ 代码语法正常")
+    except Exception as e:
+        results.append(f"❌ 代码语法错误: {e}")
+
+    # 2) Key config check
+    config_ok = True
+    if not BOT_TOKEN:
+        results.append("❌ BOT_TOKEN 未设置")
+        config_ok = False
+    if not CHAT_ID:
+        results.append("❌ CHAT_ID 未设置")
+        config_ok = False
+    if not SUPABASE_SERVICE_KEY:
+        results.append("⚠️ SUPABASE_SERVICE_KEY 未设置")
+    if not GROQ_API_KEY:
+        results.append("⚠️ GROQ_API_KEY 未设置")
+    if config_ok:
+        results.append("✅ 核心配置正常")
+
+    # 3) Claude CLI check
+    try:
+        if os.path.isfile(CLAUDE_EXE):
+            results.append("✅ Claude CLI 存在")
+        else:
+            results.append(f"❌ Claude CLI 不存在: {CLAUDE_EXE}")
+    except Exception:
+        results.append("❌ Claude CLI 检查失败")
+
+    # 4) Memory file check
+    try:
+        data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        h_count = len(data.get("history", []))
+        results.append(f"✅ memory.json 正常 ({h_count} 条记忆)")
+    except Exception as e:
+        results.append(f"❌ memory.json 损坏: {e}")
+
+    # 5) Disk space check
+    try:
+        import shutil as _sh
+        total, used, free = _sh.disk_usage(str(SCRIPT_DIR))
+        free_gb = free / (1024**3)
+        if free_gb < 1:
+            results.append(f"⚠️ 磁盘空间不足: {free_gb:.1f}GB")
+        else:
+            results.append(f"✅ 磁盘空间: {free_gb:.1f}GB 可用")
+    except Exception:
+        results.append("⚠️ 磁盘空间无法检测")
+
+    # 6) Telegram API connectivity
+    try:
+        resp = tg_api("getMe")
+        if resp.get("ok"):
+            results.append("✅ Telegram API 连接正常")
+        else:
+            results.append("❌ Telegram API 异常")
+    except Exception:
+        results.append("❌ Telegram API 无法连接")
+
+    # 7) Worker thread status
+    if _worker_thread and _worker_thread.is_alive():
+        results.append("✅ Worker 线程正常")
+    else:
+        results.append("❌ Worker 线程已停止")
+
+    # 8) Heal state summary
+    state = load_heal_state()
+    err_count = len(state.get("errors", {}))
+    results.append(f"📊 历史修复记录: {err_count} 个错误签名")
+
+    return "\n".join(results)
+
+
 # ─── Memory ──────────────────────────────────────────────────────
 def load_memory():
-    """Load memory from JSON file."""
+    """Load memory, auto-recover from backup if corrupted."""
+    # 尝试主文件
     if MEMORY_FILE.exists():
         try:
             return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            log(f"⚠️ memory.json corrupted: {e}")
+
+    # 主文件失败或不存在 → 尝试备份
+    bak_file = MEMORY_FILE.with_suffix(".json.bak")
+    if bak_file.exists():
+        try:
+            data = json.loads(bak_file.read_text(encoding="utf-8"))
+            log("✅ Recovered memory from .bak file")
+            try:
+                send_msg("⚠️ 老板，memory.json 损坏了，我从备份恢复了记忆，可能丢失最近一条对话。")
+            except Exception:
+                pass
+            return data
         except Exception:
-            pass
+            log("❌ Backup also corrupted!")
+
+    # 全部失败 → 空记忆
     return {
         "tasks": [],
         "notes": [],
@@ -678,11 +1092,107 @@ def load_memory():
 
 
 def save_memory(memory):
-    """Save memory to JSON file."""
-    MEMORY_FILE.write_text(
-        json.dumps(memory, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    """Save memory with atomic write and rolling backup. Thread-safe."""
+    with _memory_lock:
+        content = json.dumps(memory, ensure_ascii=False, indent=2)
+
+        # 1) 备份当前文件
+        bak_file = MEMORY_FILE.with_suffix(".json.bak")
+        if MEMORY_FILE.exists():
+            try:
+                shutil.copy2(MEMORY_FILE, bak_file)
+            except Exception:
+                pass
+
+        # 2) 原子写入：先写临时文件，再 rename（防写到一半损坏）
+        tmp_file = MEMORY_FILE.with_suffix(".json.tmp")
+        tmp_file.write_text(content, encoding="utf-8")
+        tmp_file.replace(MEMORY_FILE)
+
+
+# ─── Bot Mailbox (小花↔小虾 共享留言板) ──────────────────────────────
+def _load_mailbox():
+    """Load shared mailbox file."""
+    try:
+        if MAILBOX_FILE.exists():
+            return json.loads(MAILBOX_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"xiaohong_to_xiaoxia": [], "xiaoxia_to_xiaohong": [], "last_updated": ""}
+
+
+def _save_mailbox(data):
+    """Save shared mailbox file atomically."""
+    data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    tmp = MAILBOX_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(MAILBOX_FILE)
+
+
+def write_to_xiaoxia(message):
+    """小花 → 小虾：写留言到共享文件。"""
+    mb = _load_mailbox()
+    mb["xiaohong_to_xiaoxia"].append({
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "msg": message
+    })
+    # 只保留最近10条
+    mb["xiaohong_to_xiaoxia"] = mb["xiaohong_to_xiaoxia"][-10:]
+    _save_mailbox(mb)
+    log(f"Mailbox: wrote to 小虾 — {message[:60]}")
+
+
+def read_from_xiaoxia():
+    """小花 读取 小虾 留下的消息，读完清空。"""
+    mb = _load_mailbox()
+    msgs = mb.get("xiaoxia_to_xiaohong", [])
+    if msgs:
+        mb["xiaoxia_to_xiaohong"] = []
+        _save_mailbox(mb)
+    return msgs
+
+
+def read_mailbox_status():
+    """返回留言板当前状态摘要（双向）。"""
+    mb = _load_mailbox()
+    to_xia = mb.get("xiaohong_to_xiaoxia", [])
+    to_hua = mb.get("xiaoxia_to_xiaohong", [])
+    lines = [f"留言板更新时间：{mb.get('last_updated','未知')}"]
+    if to_xia:
+        lines.append(f"小花→小虾 ({len(to_xia)}条未读)：")
+        for m in to_xia[-3:]:
+            lines.append(f"  [{m['time']}] {m['msg'][:80]}")
+    else:
+        lines.append("小花→小虾：无留言")
+    if to_hua:
+        lines.append(f"小虾→小花 ({len(to_hua)}条)：")
+        for m in to_hua[-3:]:
+            lines.append(f"  [{m['time']}] {m['msg'][:80]}")
+    else:
+        lines.append("小虾→小花：无留言")
+    return "\n".join(lines)
+
+
+_ERROR_PATTERNS = [
+    "Failed to authenticate",
+    "authentication_error",
+    "API Error: 401",
+    "Invalid authentication credentials",
+    "（重试后仍无输出）",
+    "CLI 启动异常",
+]
+
+
+def _clean_history_errors(memory):
+    """Remove useless error entries from history (e.g. 401 auth failures).
+    Called once on startup to save token waste."""
+    history = memory.get("history", [])
+    before = len(history)
+    cleaned = [h for h in history if not any(p in h for p in _ERROR_PATTERNS)]
+    if len(cleaned) < before:
+        memory["history"] = cleaned
+        log(f"🧹 Cleaned {before - len(cleaned)} error entries from history")
+        save_memory(memory)
 
 
 def add_history(memory, user_msg, response):
@@ -690,11 +1200,17 @@ def add_history(memory, user_msg, response):
     - history: last 50 detailed entries (recent conversations)
     - daily_summaries: compressed daily summaries, kept for 30 days
     When old entries get pushed out, they're compressed into daily summaries.
+    Skips saving error responses (401, empty output, etc.) to keep history clean.
     """
+    # Skip saving error responses — they waste token context
+    if any(p in response for p in _ERROR_PATTERNS):
+        log("Skipped saving error response to history")
+        return
+
     today = time.strftime("%m/%d")
     ts = time.strftime("%m/%d %H:%M")
-    user_short = user_msg[:80].replace("\n", " ")
-    resp_short = response[:120].replace("\n", " ")
+    user_short = user_msg[:200].replace("\n", " ")
+    resp_short = response[:300].replace("\n", " ")
     entry = f"[{ts}] 老板: {user_short} → 秘书: {resp_short}"
 
     history = memory.setdefault("history", [])
@@ -755,59 +1271,81 @@ def auto_select_model(text, memory):
     text_lower = text.lower().strip()
     text_len = len(text_lower)
 
-    # ── HAIKU: simple greetings, short casual chat ──
+    # ── Check if this is a CONTINUATION of previous task ──
+    # "好的"、"继续"、"ok" etc. often mean "continue the previous complex task"
+    continuation_words = ["继续", "好的", "ok", "好", "收到", "了解", "嗯", "继续处理", "继续做"]
+    prev_task = memory.get("current_task", {})
+    is_continuation = (
+        text_len < 15
+        and any(w in text_lower for w in continuation_words)
+    )
+    if is_continuation:
+        # Use sonnet for continuations — they're usually follow-ups to coding tasks
+        return "sonnet", "continuation"
+
+    # ── HAIKU: greetings + simple questions that don't need coding ──
     haiku_greetings = [
         "你好", "早安", "午安", "晚安", "嗨", "hi", "hello", "hey",
-        "谢谢", "好的", "ok", "收到", "嗯", "哦", "了解",
-        "在吗", "在不在", "忙吗", "干嘛", "做什么",
+        "谢谢", "在吗", "在不在", "忙吗", "干嘛", "做什么",
+        "没事", "不用了", "算了", "没问题", "可以了", "就这样",
+        "拜拜", "再见", "晚安", "辛苦了", "不错",
     ]
     for g in haiku_greetings:
         if text_lower == g or (text_len < 8 and g in text_lower):
             return "haiku", "simple_chat"
 
+    # Simple status/query questions → haiku (no coding needed)
+    haiku_queries = [
+        "几点", "什么时候", "今天几号", "星期几", "天气",
+        "检查pm2", "查pm2", "pm2状态",
+        "今日预约", "预约多少", "有多少预约",
+        "打卡", "谁打卡了", "考勤",
+    ]
+    for q in haiku_queries:
+        if q in text_lower and text_len < 30:
+            return "haiku", "simple_query"
+
     # Very short messages with no action keywords → haiku
-    if text_len < 6 and not any(w in text_lower for w in ["查", "改", "做", "帮", "看", "写", "修"]):
+    if text_len < 6 and not any(w in text_lower for w in ["查", "改", "做", "帮", "看", "写", "修", "加", "删", "建"]):
         return "haiku", "very_short"
 
-    # ── OPUS: complex tasks needing deep reasoning ──
+    # ── OPUS: only truly complex tasks needing deep reasoning ──
+    # Keep this list TIGHT — opus is 3-5x slower than sonnet
     opus_keywords = [
-        # Architecture & design
-        "架构", "设计方案", "技术选型", "重构",
-        # Deep analysis
-        "分析一下", "详细分析", "深入分析", "全面检查", "诊断",
-        # Planning & strategy
-        "规划", "方案", "策略", "计划", "建议怎么",
-        # Complex debugging
-        "一直报错", "找不到原因", "不知道为什么", "很奇怪",
-        # Multi-step / complex
-        "整个系统", "所有项目", "全部", "从头到尾", "完整",
+        # Architecture & deep analysis only
+        "架构", "重构", "技术选型",
+        "深入分析", "全面检查", "彻底检查",
+        # Complex multi-system debugging
+        "一直报错", "找不到原因",
+        # Full system audit
+        "整个系统", "从头到尾",
         # Code review
-        "review", "代码审查", "代码质量", "优化整个",
-        # Business logic
-        "商业", "业务逻辑", "流程设计",
+        "代码审查", "代码质量",
     ]
     for kw in opus_keywords:
         if kw in text_lower:
             return "opus", "complex_task"
 
-    # Long messages (likely complex request) → opus
-    if text_len > 200:
+    # Only very long messages → opus (raised threshold)
+    if text_len > 400:
         return "opus", "long_request"
-
-    # Messages with multiple questions/tasks → opus
-    question_marks = text.count("?") + text.count("？")
-    if question_marks >= 3:
-        return "opus", "multi_question"
 
     # ── SONNET: everything else (balanced default) ──
     return "sonnet", "default"
 
 
 # ─── Claude Code ─────────────────────────────────────────────────
+_system_prompt_cache = {"text": None, "mtime": 0}
+
+
 def load_system_prompt():
-    """Load system prompt from file."""
+    """Load system prompt from file (cached, reloads on file change)."""
     if SYSTEM_PROMPT_FILE.exists():
-        return SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").strip()
+        mtime = SYSTEM_PROMPT_FILE.stat().st_mtime
+        if mtime != _system_prompt_cache["mtime"]:
+            _system_prompt_cache["text"] = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").strip()
+            _system_prompt_cache["mtime"] = mtime
+        return _system_prompt_cache["text"]
     return "你是AI秘书，用中文回复，像真人一样自然。"
 
 
@@ -818,88 +1356,208 @@ def run_claude(prompt, memory, continue_session=True):
     cwd = memory.get("cwd", DEFAULT_CWD)
     system_prompt = load_system_prompt()
 
-    # Build context from tiered memory
-    context_parts = []
+    # Build context from tiered memory (skip if continuing session — already has context)
+    if not continue_session:
+        context_parts = []
 
-    # Layer 1: Daily summaries (older context, last 7 days)
-    daily = memory.get("daily_summaries", {})
-    if daily:
-        today = time.strftime("%m/%d")
-        recent_days = sorted(daily.keys())[-7:]  # Last 7 days
-        day_lines = []
-        for day in recent_days:
-            if day == today:
-                continue  # Today's details are in history already
-            info = daily[day]
-            topics = "、".join(info["topics"][:5])
-            day_lines.append(f"  {day}: 聊了{info['count']}条 — {topics}")
-        if day_lines:
-            context_parts.append("[过去几天的对话摘要]\n" + "\n".join(day_lines))
+        # Layer 1: Daily summaries (older context, last 7 days)
+        daily = memory.get("daily_summaries", {})
+        if daily:
+            today = time.strftime("%m/%d")
+            recent_days = sorted(daily.keys())[-7:]  # Last 7 days
+            day_lines = []
+            for day in recent_days:
+                if day == today:
+                    continue  # Today's details are in history already
+                info = daily[day]
+                topics = "、".join(info["topics"][:5])
+                day_lines.append(f"  {day}: 聊了{info['count']}条 — {topics}")
+            if day_lines:
+                context_parts.append("[过去几天的对话摘要]\n" + "\n".join(day_lines))
 
-    # Layer 2: Recent detailed history (last 10 messages)
-    history = memory.get("history", [])
-    if history:
-        recent = "\n".join(history[-10:])
-        context_parts.append(f"[最近对话记录]\n{recent}")
+        # Layer 2: Recent detailed history (last 10 messages)
+        history = memory.get("history", [])
+        if history:
+            recent = "\n".join(history[-10:])
+            context_parts.append(f"[最近对话记录]\n{recent}")
 
-    # Combine context with current message
-    if context_parts:
-        context = "\n\n".join(context_parts)
-        prompt = f"{context}\n\n[当前消息]\n{prompt}"
+        # Combine context with current message
+        if context_parts:
+            context = "\n\n".join(context_parts)
+            prompt = f"{context}\n\n[当前消息]\n{prompt}"
 
-    # Build command — call node.exe + cli.js directly (NOT claude.cmd)
-    # This avoids Windows cmd.exe which truncates args at newlines
-    cmd = [NODE_EXE, CLAUDE_CLI_JS]
+    # Select max_turns based on model complexity
+    if model == "haiku":
+        max_turns = MAX_TURNS_HAIKU
+    elif model == "opus":
+        max_turns = MAX_TURNS_OPUS
+    else:
+        max_turns = MAX_TURNS_SONNET
+
+    # Build command — use claude.exe directly (compiled binary since v2.1+)
+    cmd = [CLAUDE_EXE]
     if continue_session:
         cmd.append("-c")
     cmd += [
         "-p", prompt,
         "--output-format", "text",
         "--model", model,
-        "--max-turns", str(MAX_TURNS),
+        "--max-turns", str(max_turns),
         "--dangerously-skip-permissions",
         "--append-system-prompt", system_prompt,
     ]
 
-    log(f"Running: claude -p (model={model} [{reason}], cwd={cwd})")
+    log(f"Running: claude -p (model={model} [{reason}], max_turns={max_turns}, cwd={cwd})")
 
-    # Remove CLAUDECODE env var to avoid "nested session" error
+    # Remove env vars that interfere with claude.exe auth
+    # CLAUDECODE: avoid "nested session" error
+    # CLAUDE_CODE_OAUTH_TOKEN: use credentials.json (auto-refreshed) instead of stale static token
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
 
-    # Retry logic: up to 2 attempts for empty/failed results
-    max_retries = 2
+    def _is_prompt_too_long(text):
+        """Check if text contains prompt-too-long indicators."""
+        keywords = ["prompt is too long", "prompt too long",
+                     "context length exceeded", "too many tokens", "context window"]
+        return any(kw.lower() in text.lower() for kw in keywords)
+
+    def _retry_without_session(fresh_cmd, cwd, env):
+        """Retry command without -c flag (fresh session)."""
+        try:
+            fr = subprocess.run(fresh_cmd, cwd=cwd,
+                                stdin=subprocess.DEVNULL,
+                                capture_output=True,
+                                text=True, timeout=CLAUDE_TIMEOUT,
+                                encoding="utf-8", errors="replace",
+                                shell=False, env=env)
+            if fr.stdout.strip():
+                return fr.stdout.strip()
+        except Exception as fe:
+            log(f"Fresh retry failed: {fe}")
+        return None
+
+    # Retry logic: up to 3 attempts for empty/failed/401 results
+    max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
             t_start = time.time()
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=CLAUDE_TIMEOUT,
                 encoding="utf-8",
                 errors="replace",
                 shell=False,
                 env=env
             )
+            # Store proc reference so /cancel can kill it
+            global _current_proc
+            with _current_proc_lock:
+                _current_proc = proc
+
+            try:
+                # Poll-based wait with progress updates (every 60s)
+                while True:
+                    try:
+                        raw_out, raw_err = proc.communicate(timeout=60)
+                        break  # Completed
+                    except subprocess.TimeoutExpired:
+                        elapsed_so_far = time.time() - t_start
+                        if elapsed_so_far >= CLAUDE_TIMEOUT:
+                            proc.kill()
+                            raw_out, raw_err = proc.communicate()
+                            partial = (raw_out or "").strip()
+                            if partial:
+                                return (f"⏰ 超时了（{CLAUDE_TIMEOUT//60}分钟），但有部分结果：\n\n{partial}\n\n"
+                                        f"（任务可能未完成，发消息给我继续）")
+                            return f"老板，执行超时了（{CLAUDE_TIMEOUT//60}分钟），这个任务太复杂。要不要我把它拆小来做？"
+                        # Progress update every 60s
+                        mins = int(elapsed_so_far) // 60
+                        log(f"Claude still running... {mins}m elapsed")
+                        continue  # Keep waiting
+            finally:
+                with _current_proc_lock:
+                    _current_proc = None
+
             elapsed = time.time() - t_start
-            output = result.stdout.strip()
-            stderr = result.stderr.strip() if result.stderr else ""
+            output = (raw_out or "").strip()
+            stderr = (raw_err or "").strip()
+            returncode = proc.returncode
 
             # Log diagnostics
-            log(f"Claude CLI done: exit={result.returncode}, "
+            log(f"Claude CLI done: exit={returncode}, "
                 f"stdout={len(output)}ch, stderr={len(stderr)}ch, "
                 f"time={elapsed:.1f}s (attempt {attempt}/{max_retries})")
+
+            # Cancelled by user
+            if returncode == -9 or returncode == -15 or returncode == 1 and not output and not stderr:
+                # Check if cancelled via /cancel
+                if hasattr(proc, '_cancelled'):
+                    return "✋ 任务已取消"
+
+            # Detect transient network failure (DNS/connection/timeout) — distinct from auth
+            combined = output + " " + stderr
+            combined_lower = combined.lower()
+            network_keywords = ["enotfound", "econnreset", "econnrefused", "etimedout",
+                                "getaddrinfo", "fetch failed", "socket hang up",
+                                "network is unreachable", "connection reset"]
+            is_network = any(kw in combined_lower for kw in network_keywords)
+
+            # Detect 401 auth error (only if NOT a network error)
+            is_auth = (not is_network) and (
+                "authentication_error" in combined_lower or
+                ("401" in combined and "authenticate" in combined_lower)
+            )
+
+            if is_network:
+                if attempt < max_retries:
+                    wait = min(10 * attempt, 30)
+                    log(f"🌐 Network error detected (attempt {attempt}/{max_retries}), retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    log("❌ Network error persists — returning error to user (NOT restarting)")
+                    return "🌐 老板，网络连不上 Claude 服务器，等一下再试试？（不是代码问题，等网络恢复）"
+
+            if is_auth:
+                if attempt < max_retries:
+                    wait = 5 * attempt  # 5s, 10s backoff
+                    log(f"🔑 Auth 401 detected (attempt {attempt}/{max_retries}), retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue  # retry — claude.exe handles token refresh internally
+                else:
+                    # Don't restart bot (causes spam loop). Just inform user once with cooldown.
+                    log("❌ Auth 401 persists after all retries — informing user (NOT restarting)")
+                    global _last_auth_warn_ts
+                    now = time.time()
+                    if now - _last_auth_warn_ts > 600:  # only warn once per 10 min
+                        _last_auth_warn_ts = now
+                        return "🔑 老板，Claude API 认证有问题，可能 token 需要刷新。请检查 Claude CLI 登录状态（claude /login）"
+                    return "🔑 API 认证还是不行，等会再试"
 
             if output:
                 # Detect max turns hit
                 if "Reached max turns" in output or "max turns" in output.lower():
                     return "⚠️ 老板，这次任务的操作步骤太多达到上限了。发条消息给我继续吧，我会接着做～"
+                # Detect prompt too long
+                if _is_prompt_too_long(output) and continue_session:
+                    log("Prompt too long detected, retrying without -c...")
+                    fresh_cmd = [x for x in cmd if x != "-c"]
+                    result = _retry_without_session(fresh_cmd, cwd, env)
+                    return result or "对话记录太长了，已尝试重置但失败，请发送 /new 开始新对话"
                 return output
 
             # No stdout — check stderr for clues
             if stderr:
+                if _is_prompt_too_long(stderr) and continue_session:
+                    log(f"Prompt too long detected in stderr, retrying without -c: {stderr[:200]}")
+                    fresh_cmd = [x for x in cmd if x != "-c"]
+                    result = _retry_without_session(fresh_cmd, cwd, env)
+                    return result or "对话记录太长了，已尝试重置但失败，请发送 /new 开始新对话"
                 # If it's a transient error and we can retry
                 transient_keywords = ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND",
                                       "socket hang up", "network", "fetch failed",
@@ -924,10 +1582,8 @@ def run_claude(prompt, memory, continue_session=True):
                 log(f"No output after {elapsed:.1f}s, retrying in 10s...")
                 time.sleep(10)
                 continue
-            return f"（没有输出，运行了{elapsed:.0f}秒，退出码{result.returncode}）"
+            return f"（没有输出，运行了{elapsed:.0f}秒，退出码{returncode}）"
 
-        except subprocess.TimeoutExpired:
-            return f"老板，执行超时了（{CLAUDE_TIMEOUT//60}分钟）。要不要我换个方式试试？"
         except FileNotFoundError:
             return "老板，我找不到 claude 命令。请确保 Claude Code CLI 已安装。"
         except Exception as e:
@@ -944,6 +1600,8 @@ def run_claude(prompt, memory, continue_session=True):
 def handle_command(text, memory):
     """Handle special /commands. Returns (response, should_save_memory)."""
     if text == "/new":
+        # Signal worker to reset session continuity
+        _task_queue.put({'action': 'reset'})
         return "好的老板，新对话开始了 🆕 有什么吩咐？", False
 
     if text == "/status":
@@ -997,6 +1655,75 @@ def handle_command(text, memory):
     if text == "/stop":
         return "__STOP__", False
 
+    if text == "/cancel":
+        with _current_proc_lock:
+            proc = _current_proc
+        if proc and proc.poll() is None:
+            proc._cancelled = True
+            proc.kill()
+            return "✋ 正在取消当前任务...", False
+        return "没有正在运行的任务", False
+
+    if text.startswith("/recall "):
+        keyword = text[8:].strip()
+        if not keyword:
+            return "用法：/recall 关键词（搜索对话记忆）", False
+        history = memory.get("history", [])
+        daily = memory.get("daily_summaries", {})
+        matches = []
+        # Search recent history
+        for h in history:
+            if keyword.lower() in h.lower():
+                matches.append(h)
+        # Search daily summaries
+        for day, info in sorted(daily.items()):
+            for topic in info.get("topics", []):
+                if keyword.lower() in topic.lower():
+                    matches.append(f"[{day}] {topic}")
+        if not matches:
+            return f"找不到关于「{keyword}」的记忆", False
+        result = f"🔍 搜索「{keyword}」找到 {len(matches)} 条：\n\n"
+        for m in matches[-10:]:  # Show last 10 matches
+            result += f"- {m[:120]}\n"
+        return result, False
+
+    if text in ("/health", "/ping"):
+        import platform
+        uptime_sec = time.time() - _bot_start_time
+        h, rem = divmod(int(uptime_sec), 3600)
+        m, s = divmod(rem, 60)
+        uptime_str = f"{h}h{m}m{s}s" if h else f"{m}m{s}s"
+        q_size = _task_queue.qsize()
+        history_count = len(memory.get("history", []))
+        model = memory.get("current_model", DEFAULT_MODEL)
+        # Token usage stats
+        usage = memory.get("token_usage", {})
+        today_str = time.strftime("%Y-%m-%d")
+        today_calls = usage.get(today_str, {}).get("calls", 0)
+        today_secs = usage.get(today_str, {}).get("total_seconds", 0)
+        # Worker status
+        worker_alive = _worker_thread is not None and _worker_thread.is_alive()
+        worker_status = "🟢 正常" if worker_alive else "🔴 已停止"
+        return (
+            f"🏥 小花健康报告\n"
+            f"状态：🟢 运行中\n"
+            f"运行时间���{uptime_str}\n"
+            f"Python：{platform.python_version()}\n"
+            f"Worker：{worker_status}\n"
+            f"队列待处理：{q_size}\n"
+            f"当前模型：{model}\n"
+            f"记忆条数：{history_count}\n"
+            f"今日调用：{today_calls} 次，{today_secs:.0f} 秒\n"
+            f"语音���{'✅' if VOICE_ENABLED else '❌'}\n"
+            f"Supabase：{'✅' if SUPABASE_SERVICE_KEY else '❌ 未配置'}\n"
+            f"Groq：{'✅' if GROQ_API_KEY else '❌ 未配置'}"
+        ), False
+
+    if text == "/diagnose":
+        send_msg("🔍 正在运行自我诊断，稍等...")
+        report = run_diagnose()
+        return report, False
+
     return None, False  # Not a command
 
 
@@ -1010,7 +1737,11 @@ def parse_cmd_tags(response, memory):
     for fpath in file_matches:
         fpath = fpath.strip()
         if os.path.isfile(fpath):
-            send_file(fpath)
+            ext = os.path.splitext(fpath)[1].lower()
+            if ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif'):
+                send_photo(fpath)
+            else:
+                send_file(fpath)
         else:
             log(f"[FILE:] path not found: {fpath}")
     response = re.sub(r'\[FILE:.*?\]', '', response).strip()
@@ -1043,13 +1774,176 @@ def parse_cmd_tags(response, memory):
 
 
 # ─── Main Loop ───────────────────────────────────────────────────
+LOG_FILE = SCRIPT_DIR / "bot.log"
+
+
 def log(msg):
-    """Print log to console."""
+    """Print log to console and append to bot.log file."""
     ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _track_usage(memory, elapsed_sec):
+    """Track daily Claude CLI usage in memory for /health report."""
+    today = time.strftime("%Y-%m-%d")
+    usage = memory.setdefault("token_usage", {})
+    if today not in usage:
+        usage[today] = {"calls": 0, "total_seconds": 0}
+    usage[today]["calls"] += 1
+    usage[today]["total_seconds"] += elapsed_sec
+    # Keep only last 7 days of usage data
+    for key in list(usage.keys()):
+        if key < (datetime.now().strftime("%Y-%m-%d")[:8] + "01"):  # roughly >30 days
+            pass  # fine-grained cleanup below
+    cutoff_keys = sorted(usage.keys())
+    if len(cutoff_keys) > 7:
+        for old_key in cutoff_keys[:-7]:
+            del usage[old_key]
+
+
+def task_worker(memory, typing_indicator):
+    """Process tasks from queue sequentially, maintaining Claude session continuity.
+    Runs in a dedicated thread so main loop stays responsive to new messages.
+    """
+    continue_session = False
+    current_code = "?"
+    while True:
+        task = None
+        reply_chat_id = CHAT_ID
+        try:
+            task = _task_queue.get()
+            if task is None:  # shutdown sentinel
+                break
+            # Reset session signal from /new command
+            if task.get('action') == 'reset':
+                continue_session = False
+                log("Session reset by /new")
+                _task_queue.task_done()
+                continue
+
+            current_code = task['code']
+            text = task['text']
+            reply_chat_id = task.get('chat_id', CHAT_ID)
+
+            memory["current_task"] = {
+                "status": "processing",
+                "code": current_code,
+                "user_msg": text[:200],
+                "timestamp": time.strftime("%m/%d %H:%M")
+            }
+            save_memory(memory)
+
+            t_task_start = time.time()
+            typing_indicator.start(chat_id=reply_chat_id)
+            try:
+                response = run_claude(text, memory, continue_session)
+            finally:
+                typing_indicator.stop()
+            task_elapsed = time.time() - t_task_start
+
+            # Track usage
+            _track_usage(memory, task_elapsed)
+
+            # 检查是否达到 max turns — 下次需要 continue session
+            hit_max_turns = "操作步骤太多达到上限" in response
+            if hit_max_turns:
+                # 下次"继续"时用 -c 延续 Claude 会话，不从头来
+                continue_session = True
+            else:
+                # 正常完成 → 重置 session，省 token
+                continue_session = False
+            memory["current_task"] = {"status": "done"}
+
+            response, reset_session = parse_cmd_tags(response, memory)
+            if reset_session:
+                continue_session = False
+
+            add_history(memory, text, response)
+            save_memory(memory)
+
+            send_msg(f"[{current_code}] {response}", chat_id=reply_chat_id)
+            log(f"[{current_code}] Responded ({len(response)} chars, {task_elapsed:.0f}s) to {reply_chat_id}")
+
+        except Exception as e:
+            log(f"Task worker [{current_code}] error: {e}")
+            log(traceback.format_exc())
+            try:
+                send_msg(f"[{current_code}] 出错了: {str(e)[:200]}", chat_id=reply_chat_id)
+            except Exception:
+                pass
+        finally:
+            try:
+                _task_queue.task_done()
+            except Exception:
+                pass
+
+
+_PIDFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secretary.pid")
+
+def _pid_running(pid):
+    """Check if a PID is alive AND is actually a python/secretary process."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=5
+        )
+        # Must be a python process, not some random reused PID
+        return str(pid) in result.stdout and "python" in result.stdout.lower()
+    except Exception:
+        return False
+
+def _acquire_lock():
+    if os.path.exists(_PIDFILE):
+        try:
+            old_pid = int(open(_PIDFILE).read().strip())
+            if old_pid != os.getpid() and _pid_running(old_pid):
+                print(f"[LOCK] Another secretary instance already running (PID {old_pid}). Exiting.")
+                sys.exit(99)  # 99 = duplicate instance, bat file should stop loop
+            else:
+                # Stale PID file — old process died, clean up
+                os.remove(_PIDFILE)
+        except (ValueError, IOError):
+            pass
+    with open(_PIDFILE, 'w') as f:
+        f.write(str(os.getpid()))
+    # Register cleanup on exit
+    import atexit
+    atexit.register(_release_lock)
+
+def _release_lock():
+    try:
+        if os.path.exists(_PIDFILE):
+            if int(open(_PIDFILE).read().strip()) == os.getpid():
+                os.remove(_PIDFILE)
+    except Exception:
+        pass
+
+
+def _trim_log_file():
+    """Keep bot.log under 500KB by trimming old entries."""
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 500_000:
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+            # Keep last 2000 lines
+            LOG_FILE.write_text("\n".join(lines[-2000:]) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+_bot_start_time = time.time()  # For /health uptime calculation
 
 
 def main():
+    global _bot_start_time
+    _bot_start_time = time.time()
+    _acquire_lock()
+    _trim_log_file()
     if not BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set!")
         print("Set it as an environment variable or in .env file.")
@@ -1074,9 +1968,23 @@ def main():
         # Don't let self-heal failure prevent bot from starting
 
     memory = load_memory()
+    _clean_history_errors(memory)  # Remove 401/error garbage from history
     log(f"Working directory: {memory.get('cwd', DEFAULT_CWD)}")
     log(f"Model: {memory.get('current_model', DEFAULT_MODEL)}")
     log(f"History entries: {len(memory.get('history', []))}")
+
+    # Startup throttle: suppress startup messages if restarting too frequently
+    _startup_marker = SCRIPT_DIR / "_last_startup.txt"
+    _suppress_startup_msg = False
+    try:
+        if _startup_marker.exists():
+            last_start = float(_startup_marker.read_text().strip())
+            if time.time() - last_start < 60:  # restarted within 60s = crash loop
+                _suppress_startup_msg = True
+                log("⚠️ Rapid restart detected, suppressing startup message")
+        _startup_marker.write_text(str(time.time()))
+    except Exception:
+        pass
 
     # Check for interrupted task from previous crash
     interrupted = memory.get("current_task")
@@ -1084,20 +1992,25 @@ def main():
         task_msg = interrupted.get("user_msg", "")
         task_time = interrupted.get("timestamp", "")
         log(f"Found interrupted task: {task_msg[:60]}...")
-        restart_text = "秘书重新上线了!\n\n上次掉线前正在处理你的指令:\n" + task_msg[:100] + "\n\n需要我继续处理吗? 回复 继续 我就接着做"
-        send_msg(restart_text)
+        if not _suppress_startup_msg:
+            restart_text = "秘书重新上线了!\n\n上次掉线前正在处理你的指令:\n" + task_msg[:100] + "\n\n需要我继续处理吗? 回复 继续 我就接着做"
+            send_msg(restart_text)
         # Clear the interrupted task so we don't ask again on next restart
         memory["current_task"] = {"status": "interrupted_notified", "user_msg": task_msg}
         save_memory(memory)
     else:
         # Normal startup
-        voice_status = "🎤 语音已启用" if VOICE_ENABLED else "⌨️ 仅文字模式"
-        send_msg(f"🟢 秘书上线了！{voice_status}\n有什么吩咐随时说～")
+        if not _suppress_startup_msg:
+            voice_status = "🎤 语音已启用" if VOICE_ENABLED else "⌨️ 仅文字模式"
+            send_msg(f"🟢 秘书上线了！{voice_status}\n有什么吩咐随时说～")
 
     # Start daily reporter background thread (10:00 & 22:00)
     reporter = threading.Thread(target=daily_reporter_thread, daemon=True)
     reporter.start()
     log("Daily reporter started — will send at 10:00 & 22:00 daily")
+
+    # Clean old received files on startup (>7 days)
+    _clean_received_files()
 
     # Auto backup memory on startup
     try:
@@ -1113,9 +2026,19 @@ def main():
         log(f"Memory backup failed (non-critical): {e}")
 
     typing = TypingIndicator()
-    offset = 0
-    continue_session = False
+
+    # Start task worker thread — processes messages sequentially while main loop stays responsive
+    global _worker_thread
+    worker = threading.Thread(target=task_worker, args=(memory, typing), daemon=True, name="task_worker")
+    worker.start()
+    _worker_thread = worker
+    log("Task worker started — main loop will dispatch messages to queue")
+
+    offset = memory.get("telegram_offset", 0)
+    if offset:
+        log(f"Resuming from saved offset: {offset}")
     consecutive_errors = 0
+    last_outage_log_ts = 0  # rate-limit outage logging
 
     while True:
         try:
@@ -1126,9 +2049,41 @@ def main():
             })
 
             if not resp.get("ok"):
-                log(f"getUpdates failed: {resp.get('error', '?')}")
-                time.sleep(5)
+                consecutive_errors += 1
+                # Exponential backoff: 5 → 15 → 30 → 60s (cap)
+                if consecutive_errors <= 1:
+                    backoff = 5
+                elif consecutive_errors <= 3:
+                    backoff = 15
+                elif consecutive_errors <= 6:
+                    backoff = 30
+                else:
+                    backoff = 60
+                # Rate-limit logging during long outages: log every 5 min
+                now = time.time()
+                if consecutive_errors <= 3 or (now - last_outage_log_ts) > 300:
+                    log(f"getUpdates failed (#{consecutive_errors}, backoff={backoff}s): {resp.get('error', '?')}")
+                    last_outage_log_ts = now
+                # On long outage (>10 consecutive failures over ~5min), notify boss once
+                global _last_network_warn_ts
+                if consecutive_errors == 10 and (now - _last_network_warn_ts) > 1800:
+                    _last_network_warn_ts = now
+                    try:
+                        send_msg("🌐 老板，网络好像断了，我会一直重试，等网络恢复就回来 👍")
+                    except Exception:
+                        pass
+                time.sleep(backoff)
                 continue
+
+            # Successful response — reset error counter
+            if consecutive_errors > 0:
+                if consecutive_errors >= 3:
+                    log(f"✅ Network recovered after {consecutive_errors} failures")
+                    try:
+                        send_msg("✅ 网络恢复了，小花重新上线 🎉")
+                    except Exception:
+                        pass
+                consecutive_errors = 0
 
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
@@ -1140,14 +2095,38 @@ def main():
                 # Security: only respond to configured chat ID or boss commands in GCFB group
                 sender_id = str(msg.get("from", {}).get("id", ""))
                 if chat_id != CHAT_ID:
-                    # 允许老板在 GCFB 群里发命令
-                    if GCFB_GROUP_CHAT_ID and chat_id == GCFB_GROUP_CHAT_ID and sender_id == BOSS_USER_ID:
-                        log(f"Boss command from GCFB group: {text[:50]}")
-                    else:
-                        if chat_id == GCFB_GROUP_CHAT_ID:
-                            log(f"Ignored non-boss message in GCFB group (sender: {sender_id})")
+                    if GCFB_GROUP_CHAT_ID and chat_id == GCFB_GROUP_CHAT_ID:
+                        # 只处理老大发的群消息，小花和小虾自动分工
+                        is_boss = sender_id == BOSS_USER_ID
+                        if is_boss:
+                            combined_text = (text + " " + caption).lower()
+                            # 如果老大明确叫小虾（@Gcfbai_openclaw_bot）而没有叫小花 → 小花不插话
+                            calls_xiaoxia_only = (
+                                ("gcfbai_openclaw_bot" in combined_text or "小虾" in combined_text)
+                                and "小花" not in combined_text
+                                and "gcfbboss_bot" not in combined_text
+                            )
+                            if calls_xiaoxia_only:
+                                log(f"Group msg for 小虾 only, 小花 silent: {text[:50]}")
+                                continue
+                            # ── 方案1：独立会话通道 ──
+                            # 群消息转到私聊处理，不在群里刷屏
+                            # 只有明确叫小花的消息才处理
+                            calls_xiaohua = (
+                                "小花" in combined_text
+                                or "gcfbboss_bot" in combined_text
+                            )
+                            if not calls_xiaohua:
+                                # 老大没有指名叫小花，不处理（避免抢小虾的活或无关消息）
+                                log(f"Group msg not for 小花, skipping: {text[:50]}")
+                                continue
+                            # 群里回复（不转私聊，让群成员也看到）
+                            log(f"Group msg from boss for 小花: {text[:50]}")
                         else:
-                            log(f"Ignored message from unknown chat: {chat_id}")
+                            log(f"Ignored non-boss message in GCFB group (sender: {sender_id})")
+                            continue
+                    else:
+                        log(f"Ignored message from unknown chat: {chat_id}")
                         continue
 
                 # ── Handle voice message ──
@@ -1175,7 +2154,8 @@ def main():
                     file_id = photo[-1]["file_id"]
                     path = download_telegram_file(file_id, suffix=".jpg")
                     if path:
-                        text = (text or caption or "") + f"\n[用户发了一张图片，已保存在: {path}]"
+                        user_caption = text or caption or ""
+                        text = user_caption + f"\n[用户发了一张图片，已保存在: {path}。请务必用 Read 工具读取这个图片文件，看清楚图片内容后再回答。]"
 
                 # ── Handle document/file ──
                 doc = msg.get("document")
@@ -1205,52 +2185,35 @@ def main():
                         save_memory(memory)
                     continue
 
-                # Handle /new: next claude call without -c
-                if text == "/new":
-                    continue_session = False
-                    send_msg("好的老板，新对话开始了 🆕")
-                    continue
+                # Normal message → enqueue for background processing
+                # Main loop stays responsive; worker sends result with task code
+                code = _next_task_code()
+                q_size = _task_queue.qsize()
+                queue_note = f"（前面还有 {q_size} 个任务排队）" if q_size > 0 else ""
+                send_msg(f"[{code}] 收到，处理中...{queue_note}", chat_id=chat_id)
+                _task_queue.put({'code': code, 'text': text, 'chat_id': chat_id})
+                log(f"[{code}] Queued (pos={q_size+1}): {text[:60]}")
+                consecutive_errors = 0
 
-                # Normal message → send to Claude Code
-                # Immediately acknowledge receipt so user knows we're working
-                send_msg("收到～正在处理中，稍等一下 ⏳")
+                # Watchdog: restart worker if it died
+                if _worker_thread and not _worker_thread.is_alive():
+                    log("⚠️ Worker thread died! Restarting...")
+                    _worker_thread = threading.Thread(
+                        target=task_worker, args=(memory, typing), daemon=True, name="task_worker"
+                    )
+                    _worker_thread.start()
+                    log("✅ Worker thread restarted")
 
-                # Track current task in case of crash
-                memory["current_task"] = {
-                    "status": "processing",
-                    "user_msg": text[:200],
-                    "timestamp": time.strftime("%m/%d %H:%M")
-                }
+            # Persist offset after processing batch (prevents duplicate processing on restart)
+            if resp.get("result") and offset != memory.get("telegram_offset", 0):
+                memory["telegram_offset"] = offset
                 save_memory(memory)
-
-                typing.start()
-                try:
-                    response = run_claude(text, memory, continue_session)
-                finally:
-                    typing.stop()
-
-                # Task completed — clear tracking
-                memory["current_task"] = {"status": "done"}
-
-                continue_session = True  # subsequent messages continue conversation
-
-                # Parse any [CMD:...] and [FILE:...] tags
-                response, reset_session = parse_cmd_tags(response, memory)
-                if reset_session:
-                    continue_session = False
-
-                # Save conversation history
-                add_history(memory, text, response)
-                save_memory(memory)
-
-                send_msg(response)
-                log(f"Responded ({len(response)} chars)")
-                consecutive_errors = 0  # Reset on successful processing
 
         except KeyboardInterrupt:
             log("Shutting down (Ctrl+C)")
             send_msg("🔴 秘书下线了")
             save_memory(memory)
+            _release_lock()
             break
         except Exception as e:
             consecutive_errors += 1
@@ -1288,228 +2251,247 @@ def _take_screenshot():
         return None
 
 
-def _query_lds():
-    """Open LDS admin in Chrome, login, read today's stats. Returns text summary."""
+
+def send_booking_report_5pm():
+    """每天 17:00 发送今日预约汇报。"""
+    import urllib.request as _urllib
+    import json as _json
+
+    now = datetime.now()
+    date_str = now.strftime('%Y-%m-%d')
+    log("Booking report 17:00 triggered")
+
+    ctx = SSL_CTX  # Use global certifi-backed SSL context
+
+    BOOK_API = f"https://script.google.com/macros/s/AKfycbyq1uhgRek_xCtOeAeWnS6mKxoYI4FMSiezAHlGHB-GXkJNGIZNTaotIT76CmKNvoY_/exec?page=api&key=zchhp2024&action={date_str}"
+
     try:
-        import pyautogui
-        import time as _time
+        req = _urllib.Request(BOOK_API, headers={"User-Agent": "Mozilla/5.0"})
+        raw = _urllib.urlopen(req, context=ctx, timeout=20).read().decode()
+        book = _json.loads(raw)
+        bookings = book.get('bookings', [])
+        total_b = book.get('total', len(bookings))
 
-        sx, sy = 1920 / 1456, 1080 / 816
+        lines = [f"📅 今日预约汇报 {date_str}  共 {total_b} 张"]
+        if bookings:
+            for b in bookings:
+                status_icon = "✅" if b.get('status') == 'accepted' else ("❌" if b.get('status') == 'cancelled' else "⏳")
+                lines.append(f"{status_icon} {b.get('time','?')}  {b.get('name','?')}  {b.get('pax','?')}人")
+        else:
+            lines.append("今日暂无预约")
 
-        def sc(x, y):
-            return int(x * sx), int(y * sy)
-
-        # Open new Chrome window with LDS
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command",
-             f'Start-Process "chrome.exe" -ArgumentList "--new-window","{LDS_URL}"']
-        )
-        _time.sleep(8)
-
-        # Dismiss any popup and wait for login page
-        _take_screenshot()
-        pyautogui.click(*sc(997, 134))
-        _time.sleep(1)
-
-        # Login
-        pyautogui.click(*sc(1046, 444))
-        _time.sleep(0.4)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(LDS_USER, interval=0.1)
-        _time.sleep(0.3)
-        pyautogui.press('tab')
-        _time.sleep(0.3)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(LDS_PASS, interval=0.1)
-        _time.sleep(0.3)
-        pyautogui.press('enter')
-        _time.sleep(6)
-
-        # Take screenshot to read stats
-        _take_screenshot()
-
-        # Read image for text (use Claude vision via run_claude is too slow here,
-        # so we use pyautogui to scroll down to see 7-day table then screenshot again)
-        pyautogui.click(*sc(1200, 400))
-        _time.sleep(0.3)
-        pyautogui.press('pageup')  # go to top first
-        _time.sleep(0.5)
-        _take_screenshot()  # capture top stats: 总用户, 今日新用户, 今日抽奖
-
-        # Read the numbers from screen by scrolling to the 7-day table
-        pyautogui.press('pagedown')
-        _time.sleep(1)
-        _take_screenshot()
-
-        # Close the LDS Chrome window
-        pyautogui.hotkey('alt', 'F4')
-        _time.sleep(1)
-
-        return "LDS截图已采集"
+        send_msg("\n".join(lines))
     except Exception as e:
-        log(f"LDS query error: {e}")
-        return f"LDS查询失败: {e}"
+        log(f"send_booking_report_5pm error: {e}")
+        send_msg(f"⚠️ 预约汇报查询失败: {e}")
 
 
-def _query_booking():
-    """Open Booking admin in Chrome, login, read today's bookings. Returns text summary."""
+def send_pm2_report():
+    """每天 9:00 检查所有 PM2 进程状态并汇报"""
     try:
-        import pyautogui
-        import time as _time
-
-        sx, sy = 1920 / 1456, 1080 / 816
-
-        def sc(x, y):
-            return int(x * sx), int(y * sy)
-
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command",
-             f'Start-Process "chrome.exe" -ArgumentList "--new-window","{BOOKING_URL}"']
+        result = subprocess.run(
+            "npx pm2 jlist",
+            shell=True, capture_output=True, text=True, timeout=30,
+            cwd=str(SCRIPT_DIR)
         )
-        _time.sleep(8)
+        if result.returncode != 0 or not result.stdout.strip():
+            send_msg(f"⚠️ PM2 检查失败\n{result.stderr[:150]}")
+            return
 
-        # Login
-        pyautogui.click(*sc(1046, 444))
-        _time.sleep(0.3)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(BOOKING_USER, interval=0.1)
-        pyautogui.press('tab')
-        _time.sleep(0.3)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(BOOKING_PASS, interval=0.1)
-        pyautogui.press('enter')
-        _time.sleep(5)
+        import json as _pj
+        try:
+            processes = _pj.loads(result.stdout)
+        except Exception:
+            send_msg(f"⚠️ PM2 输出解析失败：{result.stdout[:200]}")
+            return
 
-        _take_screenshot()
+        if not processes:
+            send_msg("🔴 PM2 目前没有任何进程")
+            return
 
-        pyautogui.hotkey('alt', 'F4')
-        _time.sleep(1)
+        lines = [f"🤖 PM2 状态 09:00  {datetime.now().strftime('%Y-%m-%d')}"]
+        all_ok = True
+        for p in processes:
+            name = p.get('name', '?')
+            env = p.get('pm2_env', {})
+            status = env.get('status', '?')
+            restarts = env.get('restart_time', 0)
+            mem_bytes = (p.get('monit') or {}).get('memory', 0)
+            mem_mb = round(mem_bytes / 1024 / 1024, 1)
 
-        return "预约截图已采集"
+            icon = '✅' if status == 'online' else '❌'
+            if status != 'online':
+                all_ok = False
+
+            restart_note = ''
+            if restarts > 10:
+                restart_note = f'  ⚠️重启{restarts}次'
+            elif restarts > 0:
+                restart_note = f'  (重启{restarts}次)'
+
+            lines.append(f"{icon} {name}  {status}  {mem_mb}MB{restart_note}")
+
+        lines.append('')
+        lines.append('全部正常 👍' if all_ok else '⚠️ 有进程不正常，请检查！')
+        send_msg('\n'.join(lines))
+        log("PM2 status report sent at 09:00")
     except Exception as e:
-        log(f"Booking query error: {e}")
-        return f"预约查询失败: {e}"
+        send_msg(f"❌ PM2 检查出错：{str(e)[:100]}")
+        log(f"PM2 report error: {e}")
 
 
 def send_daily_report():
-    """Compose and send the daily report by querying LDS + Booking via Chrome."""
+    """Compose and send the daily report. Morning (10am) = booking + LDS brief. Evening (10pm) = full report."""
+    import urllib.request as _urllib
+    import json as _json
+
     now = datetime.now()
-    period = "早上" if now.hour < 12 else "晚上"
+    is_morning = now.hour < 12
+    period = "早上" if is_morning else "晚上"
+    date_str = now.strftime('%Y-%m-%d')
     log(f"Daily report triggered at {now.strftime('%H:%M')}")
     send_msg(f"⏰ {period} {now.strftime('%H:%M')} 自动汇报来了，正在查数据...")
 
+    ctx = SSL_CTX  # Use global certifi-backed SSL context
+
+    LDS_API        = "https://script.google.com/macros/s/AKfycbzTxymBxmmliLWpOdg-lh-Ev6tDKyjEf91wgTaDAtxx0gtEsZZrsL9rL9AFv7-XaySlew/exec?page=api&key=zchhp2024"
+    BOOK_API       = "https://script.google.com/macros/s/AKfycbyq1uhgRek_xCtOeAeWnS6mKxoYI4FMSiezAHlGHB-GXkJNGIZNTaotIT76CmKNvoY_/exec?page=api&key=zchhp2024"
+    CHAT_STATS_API = "https://script.google.com/macros/s/AKfycbw45op0Bqn4E8iHIbVLdGi-cLWFt-rEiEooWzwiynd6zIv6WoR7X9vIShdzIjTAa-_v/exec?action=stats&key=zchhp2024"
+
     try:
-        import pyautogui
-        import time as _time
+        # ── Query Booking (both reports need it) ──
+        req2 = _urllib.Request(BOOK_API, headers={"User-Agent": "Mozilla/5.0"})
+        book = _json.loads(_urllib.urlopen(req2, context=ctx, timeout=20).read().decode())
+        bookings = book.get('bookings', [])
+        total_b  = book.get('total', len(bookings))
+        pending  = book.get('pending', '?')
+        accepted = book.get('accepted', '?')
 
-        sx, sy = 1920 / 1456, 1080 / 816
+        if is_morning:
+            # ════ 早报 10am：今日预约列表 + 昨日LDS新用户 + 打印服务器状态 ════
+            req = _urllib.Request(LDS_API, headers={"User-Agent": "Mozilla/5.0"})
+            lds = _json.loads(_urllib.urlopen(req, context=ctx, timeout=20).read().decode())
 
-        def sc(x, y):
-            return int(x * sx), int(y * sy)
+            book_lines = [f"📅 今日预约 {date_str}  共 {total_b} 张"]
+            if bookings:
+                for b in bookings:
+                    status_icon = "✅" if b.get('status') == 'accepted' else ("❌" if b.get('status') == 'cancelled' else "⏳")
+                    line = f"{status_icon} {b.get('time','?')}  {b.get('name','?')}  {b.get('pax','?')}人"
+                    book_lines.append(line)
+            else:
+                book_lines.append("今日暂无预约")
 
-        # ── Query LDS ──
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command",
-             f'Start-Process "chrome.exe" -ArgumentList "--new-window","{LDS_URL}"']
-        )
-        _time.sleep(9)
+            # ── 打印服务器状态（9点已自动重启，检查是否正常）──
+            try:
+                import urllib.request as _ur2
+                ps_req = _ur2.Request("http://localhost:3333/health", headers={"User-Agent": "Mozilla/5.0"})
+                ps_resp = _json.loads(_ur2.urlopen(ps_req, timeout=5).read().decode())
+                ps_ok = ps_resp.get('status') == 'ok'
+                ps_connected = ps_resp.get('realtimeConnected', False)
+                if ps_ok and ps_connected:
+                    print_status = "✅ 打印服务器正常（9:00 已重启）"
+                else:
+                    print_status = f"⚠️ 打印服务器异常 status={ps_resp.get('status')} connected={ps_connected}"
+            except Exception as _pe:
+                print_status = f"❌ 打印服务器无响应 ({str(_pe)[:50]})"
 
-        # Dismiss popup if any
-        _take_screenshot()
-        pyautogui.click(*sc(997, 134))
-        _time.sleep(1)
+            report = (
+                f"🌅 早报 {date_str}\n\n"
+                + "\n".join(book_lines)
+                + f"\n\n🎰 昨日LDS新用户：{lds.get('todayNewUsers', '?')} 人  累计：{lds.get('totalUsers', '?')} 人"
+                + f"\n\n🖨 {print_status}"
+            )
 
-        # Login LDS
-        pyautogui.click(*sc(1046, 444))
-        _time.sleep(0.4)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(LDS_USER, interval=0.1)
-        pyautogui.press('tab')
-        _time.sleep(0.3)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(LDS_PASS, interval=0.1)
-        pyautogui.press('enter')
-        _time.sleep(7)
+        else:
+            # ════ 晚报 10pm：LDS完整 + 预约汇总 + 小慧 + DocuScan ════
+            req = _urllib.Request(LDS_API, headers={"User-Agent": "Mozilla/5.0"})
+            lds = _json.loads(_urllib.urlopen(req, context=ctx, timeout=20).read().decode())
 
-        # Scroll to 7-day table area
-        pyautogui.click(*sc(1200, 400))
-        _time.sleep(0.3)
-        pyautogui.press('pagedown')
-        _time.sleep(1)
-        lds_ss = _take_screenshot()
+            try:
+                req3 = _urllib.Request(CHAT_STATS_API, headers={"User-Agent": "Mozilla/5.0"})
+                chat_stats = _json.loads(_urllib.urlopen(req3, context=ctx, timeout=20).read().decode())
+            except Exception:
+                chat_stats = None
 
-        # Read the LDS stats panel (top numbers are still visible in top bar)
-        # Take one more screenshot to capture the full 7-day table
-        pyautogui.press('pagedown')
-        _time.sleep(0.8)
-        _take_screenshot()
+            # DocuScan Supabase query (credentials loaded from .env)
+            try:
+                docu_req = _urllib.Request(
+                    f"{SUPABASE_URL}/rest/v1/documents?select=id,doc_type,status,created_at",
+                    headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "User-Agent": "Mozilla/5.0"}
+                )
+                docu_data = _json.loads(_urllib.urlopen(docu_req, context=ctx, timeout=15).read().decode())
+                today_docs = [d for d in docu_data if (d.get('created_at') or '')[:10] == date_str]
+                docu_stats = {
+                    'total': len(docu_data),
+                    'today': len(today_docs),
+                    'pending': sum(1 for d in docu_data if d.get('status') == 'pending_review'),
+                    'confirmed': sum(1 for d in docu_data if d.get('status') == 'confirmed'),
+                    'exported': sum(1 for d in docu_data if d.get('status') == 'exported'),
+                }
+            except Exception:
+                docu_stats = None
 
-        # Scroll back to top to read top-bar numbers
-        pyautogui.hotkey('ctrl', 'Home')
-        _time.sleep(0.5)
-        lds_top_ss = _take_screenshot()
+            # LDS section
+            lds_lines = [
+                "🎰 【抽奖系统 LDS】",
+                f"今日新用户：{lds.get('todayNewUsers', '?')} 人  累计：{lds.get('totalUsers', '?')} 人",
+                f"今日抽奖：{lds.get('todayDraws', '?')} 次  累计：{lds.get('totalDraws', '?')} 次",
+                f"今日兑换：{lds.get('todayVerified', '?')} 张  累计已兑换：{lds.get('totalVerified', '?')} 张",
+                f"待兑换：{lds.get('totalPending', '?')} 张",
+            ]
 
-        # Close LDS window
-        pyautogui.hotkey('alt', 'F4')
-        _time.sleep(1.5)
+            # Booking section
+            book_lines = [
+                f"📅 【预约系统】今日 {date_str} 共 {total_b} 张",
+                f"待处理：{pending}  已接受：{accepted}",
+            ]
+            if bookings:
+                for b in bookings:
+                    status_icon = "✅" if b.get('status') == 'accepted' else ("❌" if b.get('status') == 'cancelled' else "⏳")
+                    line = f"{status_icon} {b.get('time','?')}  {b.get('name','?')}  {b.get('pax','?')}人"
+                    book_lines.append(line)
+            else:
+                book_lines.append("今日暂无预约")
 
-        # ── Query Booking ──
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-Command",
-             f'Start-Process "chrome.exe" -ArgumentList "--new-window","{BOOKING_URL}"']
-        )
-        _time.sleep(9)
+            # 小慧 section
+            if chat_stats and 'conversations' in chat_stats:
+                conv = chat_stats['conversations']
+                bk   = chat_stats.get('bookings', {})
+                chat_lines = [
+                    "🤖 【小慧 AI 客服】",
+                    f"今日对话：{conv.get('today', 0)} 场  本月累计：{conv.get('thisMonth', 0)} 场",
+                    f"促成预约：本月 {bk.get('thisMonth', 0)} 个  总计 {bk.get('total', 0)} 个",
+                ]
+            else:
+                chat_lines = ["🤖 【小慧 AI 客服】数据查询失败"]
 
-        # Login Booking
-        pyautogui.click(*sc(1046, 444))
-        _time.sleep(0.3)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(BOOKING_USER, interval=0.1)
-        pyautogui.press('tab')
-        _time.sleep(0.3)
-        pyautogui.hotkey('ctrl', 'a')
-        pyautogui.typewrite(BOOKING_PASS, interval=0.1)
-        pyautogui.press('enter')
-        _time.sleep(6)
+            # DocuScan section
+            if docu_stats:
+                docu_lines = [
+                    "📄 【DocuScan 文件系统】",
+                    f"今日扫描：{docu_stats['today']} 份  累计：{docu_stats['total']} 份",
+                    f"待审核：{docu_stats['pending']} 份  已确认：{docu_stats['confirmed']} 份  已导出：{docu_stats['exported']} 份",
+                ]
+            else:
+                docu_lines = ["📄 【DocuScan 文件系统】数据查询失败"]
 
-        booking_ss = _take_screenshot()
+            report = (
+                f"📊 晚报 {date_str}\n\n"
+                + "\n".join(lds_lines)
+                + "\n\n"
+                + "\n".join(book_lines)
+                + "\n\n"
+                + "\n".join(chat_lines)
+                + "\n\n"
+                + "\n".join(docu_lines)
+            )
 
-        # Close Booking window
-        pyautogui.hotkey('alt', 'F4')
-        _time.sleep(1)
+        send_msg(report)
+        log("Daily report sent successfully via API")
 
-        # ── Build report from screenshots using Claude ──
-        date_str = now.strftime('%Y-%m-%d')
-        prompt = (
-            f"现在是 {now.strftime('%Y-%m-%d %H:%M')}，这是自动日报。\n"
-            f"我刚才用 Chrome 截图了 LDS 抽奖系统和预约系统的数据，"
-            f"截图已保存在 {SS_PATH}。\n"
-            f"请读取最新的截图文件（{SS_PATH}），"
-            "结合你在截图里看到的数字，整理成以下格式的汇报（纯文字，不要markdown）：\n\n"
-            f"📊 {period}汇报 {date_str}\n\n"
-            "【抽奖系统 LDS】\n"
-            "总用户：xxx 人\n"
-            "今日新用户：xxx 人\n"
-            "今日抽奖：xxx 次\n"
-            "待核销奖品：xxx 张\n\n"
-            "【预约系统】\n"
-            f"今日 {date_str} 预约共 x 张：\n"
-            "列出每条预约（时间、姓名、人数、电话）\n\n"
-            "如果截图里看不清某个数字，就写[查不到]。"
-        )
-
-        response = run_claude(prompt, {}, continue_session=False)
-        response, _ = parse_cmd_tags(response, {})
-        response = clean_markdown(response)
-
-        send_msg(response)
-        log("Daily report sent successfully")
-
-    except ImportError:
-        send_msg("自动汇报需要 pyautogui，请先安装：pip install pyautogui")
     except Exception as e:
         log(f"Daily report error: {e}")
-        send_msg(f"自动汇报出错了 😅\n{str(e)[:200]}")
+        send_msg(f"自动汇报出错了 😅\n{str(e)[:300]}")
 
 
 def check_scheduled_tasks(now):
@@ -1553,9 +2535,100 @@ def check_scheduled_tasks(now):
         log(f"check_scheduled_tasks error: {e}")
 
 
+def sync_ddfresh_prices():
+    """每天 22:10 自动同步 DD Fresh 最新报价（DD Fresh 22:00 更新）"""
+    try:
+        import subprocess
+        script = str(SCRIPT_DIR / "sync_supplier_prices.py")
+        result = subprocess.run(
+            ["python", script],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+        )
+        log(f"DD Fresh sync done: {result.stdout[-300:] if result.stdout else 'no output'}")
+        if result.returncode != 0:
+            log(f"DD Fresh sync error: {result.stderr[-200:]}")
+    except Exception as e:
+        log(f"DD Fresh sync exception: {e}")
+
+
+def sync_ebuy_prices():
+    """每天 22:20 自动同步 eBuy 最新报价"""
+    try:
+        import subprocess
+        script = str(SCRIPT_DIR / "sync_ebuy_prices.py")
+        result = subprocess.run(
+            ["python", script],
+            capture_output=True, text=True, timeout=180,
+            encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"}
+        )
+        log(f"eBuy sync done: {result.stdout[-300:] if result.stdout else 'no output'}")
+        if result.returncode != 0:
+            log(f"eBuy sync error: {result.stderr[-200:]}")
+    except Exception as e:
+        log(f"eBuy sync exception: {e}")
+
+
+# ─── Health Check System ─────────────────────────────────────────
+HEALTH_STATE_FILE = SCRIPT_DIR / "health_state.json"
+
+def load_health_state():
+    """Load last health check status from disk."""
+    if HEALTH_STATE_FILE.exists():
+        try:
+            with open(HEALTH_STATE_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_health_state(state):
+    """Save health check status to disk."""
+    with open(HEALTH_STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+def check_system_health():
+    """Check health of all critical systems, send alert if status changes."""
+    health_state = load_health_state()
+
+    # Define systems to monitor
+    systems = {
+        "HRMS": "https://script.google.com/macros/s/AKfycbzTdyny8bM_kobrbxCmaYBR3oYhVVr0n8wLGtSKj339/exec?page=api&key=zchhp2024",
+        "LDS": "https://script.google.com/macros/s/AKfycbzTxymBxmmliLWpOdg-lh-Ev6tDKyjEf91wgTaDAtxx0gtEsZZrsL9rL9AFv7-XaySlew/exec?page=api&key=zchhp2024",
+        "Booking": "https://script.google.com/macros/s/AKfycbyq1uhgRek_xCtOeAeWnS6mKxoYI4FMSiezAHlGHB-GXkJNGIZNTaotIT76CmKNvoY_/exec?page=api&key=zchhp2024",
+        "DocuScan": "https://docuscan-pro.vercel.app/api/health"  # You may need to adjust this endpoint
+    }
+
+    alerts = []
+
+    for system_name, url in systems.items():
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as resp:
+                is_healthy = 200 <= resp.status < 400
+        except:
+            is_healthy = False
+
+        # Check if status changed
+        prev_status = health_state.get(system_name, True)  # default to healthy
+        if is_healthy != prev_status:
+            if is_healthy:
+                alerts.append(f"✅ {system_name} 已恢复正常")
+            else:
+                alerts.append(f"⚠️ {system_name} 无法访问！")
+            health_state[system_name] = is_healthy
+
+    if alerts:
+        send_msg("系统监控告警:\n" + "\n".join(alerts))
+
+    save_health_state(health_state)
+
 def daily_reporter_thread():
     """Background daemon thread: check time every minute, trigger report at 10:00 & 22:00."""
     sent_keys = set()   # (date_str, hour) pairs already sent today
+    last_health_check = 0  # timestamp of last health check
 
     while True:
         try:
@@ -1568,8 +2641,53 @@ def daily_reporter_thread():
                     t = threading.Thread(target=send_daily_report, daemon=True)
                     t.start()
 
+            # PM2 状态检查：每天 9:00
+            if now.hour == 9 and now.minute == 0:
+                key = (now.strftime("%Y-%m-%d"), "pm2_check")
+                if key not in sent_keys:
+                    sent_keys.add(key)
+                    t = threading.Thread(target=send_pm2_report, daemon=True)
+                    t.start()
+                    log("PM2 status check triggered at 09:00")
+
+            # 预约汇报：每天 17:00
+            if now.hour == 17 and now.minute == 0:
+                key = (now.strftime("%Y-%m-%d"), "booking_5pm")
+                if key not in sent_keys:
+                    sent_keys.add(key)
+                    t = threading.Thread(target=send_booking_report_5pm, daemon=True)
+                    t.start()
+                    log("Booking report 17:00 triggered")
+
+            # DD Fresh 价格同步：每天 22:10（DD Fresh 22:00 更新价格）
+            if now.hour == 22 and now.minute == 10:
+                key = (now.strftime("%Y-%m-%d"), "ddfresh")
+                if key not in sent_keys:
+                    sent_keys.add(key)
+                    t = threading.Thread(target=sync_ddfresh_prices, daemon=True)
+                    t.start()
+                    log("DD Fresh price sync started")
+
+            # eBuy 价格同步：每天 22:20
+            if now.hour == 22 and now.minute == 20:
+                key = (now.strftime("%Y-%m-%d"), "ebuy")
+                if key not in sent_keys:
+                    sent_keys.add(key)
+                    t = threading.Thread(target=sync_ebuy_prices, daemon=True)
+                    t.start()
+                    log("eBuy price sync started")
+
             # Check scheduled one-off tasks (e.g. special report promised to boss)
             check_scheduled_tasks(now)
+
+            # Health check disabled by boss on 2026-03-05
+            # current_time = time.time()
+            # if current_time - last_health_check >= 300:
+            #     try:
+            #         check_system_health()
+            #     except Exception as e:
+            #         log(f"Health check error: {e}")
+            #     last_health_check = current_time
 
             # Clean up keys from previous days
             today = now.strftime("%Y-%m-%d")
