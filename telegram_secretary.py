@@ -189,6 +189,7 @@ def clean_response(text):
     """Remove internal context headers that may leak into Claude's response."""
     # Strip context headers that were injected into the prompt
     headers = [
+        r'\[永久知识库\].*?(?=\[当前消息\]|\Z)',
         r'\[最近对话记录\].*?(?=\[当前消息\]|\Z)',
         r'\[过去几天的对话摘要\].*?(?=\[当前消息\]|\Z)',
         r'\[当前消息\]\s*',
@@ -1087,7 +1088,13 @@ def load_memory():
         "notes": [],
         "history": [],
         "current_model": DEFAULT_MODEL,
-        "cwd": DEFAULT_CWD
+        "cwd": DEFAULT_CWD,
+        "knowledge_base": {
+            "people": {},
+            "systems": {},
+            "rules": [],
+            "lessons": []
+        }
     }
 
 
@@ -1129,17 +1136,22 @@ def _save_mailbox(data):
     tmp.replace(MAILBOX_FILE)
 
 
-def write_to_xiaoxia(message):
-    """小花 → 小虾：写留言到共享文件。"""
+def write_to_xiaoxia(message, msg_type="INFO", priority="normal"):
+    """小花 → 小虾：写留言到共享文件。
+    msg_type: INFO | ALERT | TASK | HANDOFF
+    priority: high | normal | low
+    """
     mb = _load_mailbox()
     mb["xiaohong_to_xiaoxia"].append({
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "type": msg_type,
+        "priority": priority,
         "msg": message
     })
-    # 只保留最近10条
-    mb["xiaohong_to_xiaoxia"] = mb["xiaohong_to_xiaoxia"][-10:]
+    # 只保留最近20条
+    mb["xiaohong_to_xiaoxia"] = mb["xiaohong_to_xiaoxia"][-20:]
     _save_mailbox(mb)
-    log(f"Mailbox: wrote to 小虾 — {message[:60]}")
+    log(f"Mailbox → 小虾 [{msg_type}/{priority}]: {message[:60]}")
 
 
 def read_from_xiaoxia():
@@ -1171,6 +1183,21 @@ def read_mailbox_status():
     else:
         lines.append("小虾→小花：无留言")
     return "\n".join(lines)
+
+
+def check_xiaoxia_mailbox():
+    """检查小虾发来的消息，转发给老板。每小时自动调用一次。"""
+    msgs = read_from_xiaoxia()
+    if not msgs:
+        return
+    lines = ["📬 小虾发来消息："]
+    for m in msgs:
+        mtype = m.get("type", "INFO")
+        priority = m.get("priority", "normal")
+        icon = "🚨" if priority == "high" else ("📋" if mtype == "TASK" else "ℹ️")
+        lines.append(f"{icon} [{m['time'][5:16]}] {m['msg']}")
+    send_msg("\n".join(lines))
+    log(f"Forwarded {len(msgs)} messages from 小虾 to boss")
 
 
 _ERROR_PATTERNS = [
@@ -1217,11 +1244,11 @@ def add_history(memory, user_msg, response):
     history.append(entry)
 
     # Before trimming, compress old entries into daily summaries
-    if len(history) > 50:
+    if len(history) > 100:
         # Entries that will be removed
-        overflow = history[:-50]
+        overflow = history[:-100]
         _compress_to_daily(memory, overflow)
-        memory["history"] = history[-50:]
+        memory["history"] = history[-100:]
 
     # Clean up daily summaries older than 30 days
     summaries = memory.get("daily_summaries", {})
@@ -1255,6 +1282,22 @@ def _compress_to_daily(memory, entries):
                 # Keep max 10 topics per day
                 summaries[day]["topics"] = summaries[day]["topics"][-10:]
         summaries[day]["count"] += 1
+
+
+def add_to_knowledge_base(memory, category, key, value):
+    """Add or update a fact in the permanent knowledge base."""
+    kb = memory.setdefault("knowledge_base", {
+        "people": {}, "systems": {}, "rules": [], "lessons": []
+    })
+    if category in ("people", "systems"):
+        kb[category][key] = value
+    elif category in ("rules", "lessons"):
+        target = kb[category]
+        entry = f"{key}: {value}" if key else value
+        if entry not in target:
+            target.append(entry)
+            # Keep last 20 rules/lessons
+            kb[category] = target[-20:]
 
 
 # ─── Smart Model Selection ───────────────────────────────────────
@@ -1360,6 +1403,21 @@ def run_claude(prompt, memory, continue_session=True):
     if not continue_session:
         context_parts = []
 
+        # Layer 0: Knowledge base — permanent facts about people, systems, rules, lessons
+        kb = memory.get("knowledge_base", {})
+        kb_lines = []
+        if kb.get("people"):
+            for name, info in list(kb["people"].items())[:10]:
+                kb_lines.append(f"  [{name}]: {info}")
+        if kb.get("rules"):
+            for rule in kb["rules"][-5:]:
+                kb_lines.append(f"  [规则] {rule}")
+        if kb.get("lessons"):
+            for lesson in kb["lessons"][-5:]:
+                kb_lines.append(f"  [教训] {lesson}")
+        if kb_lines:
+            context_parts.append("[永久知识库]\n" + "\n".join(kb_lines))
+
         # Layer 1: Daily summaries (older context, last 7 days)
         daily = memory.get("daily_summaries", {})
         if daily:
@@ -1375,10 +1433,10 @@ def run_claude(prompt, memory, continue_session=True):
             if day_lines:
                 context_parts.append("[过去几天的对话摘要]\n" + "\n".join(day_lines))
 
-        # Layer 2: Recent detailed history (last 10 messages)
+        # Layer 2: Recent detailed history (last 20 messages)
         history = memory.get("history", [])
         if history:
-            recent = "\n".join(history[-10:])
+            recent = "\n".join(history[-20:])
             context_parts.append(f"[最近对话记录]\n{recent}")
 
         # Combine context with current message
@@ -1969,9 +2027,14 @@ def main():
 
     memory = load_memory()
     _clean_history_errors(memory)  # Remove 401/error garbage from history
+    # Expose memory globally so daily_reporter_thread can access it for self-review
+    import __main__
+    __main__._global_memory = memory
     log(f"Working directory: {memory.get('cwd', DEFAULT_CWD)}")
     log(f"Model: {memory.get('current_model', DEFAULT_MODEL)}")
     log(f"History entries: {len(memory.get('history', []))}")
+    log(f"Knowledge base: {len(memory.get('knowledge_base', {}).get('lessons', []))} lessons, "
+        f"{len(memory.get('knowledge_base', {}).get('people', {}))} people")
 
     # Startup throttle: suppress startup messages if restarting too frequently
     _startup_marker = SCRIPT_DIR / "_last_startup.txt"
@@ -2407,30 +2470,6 @@ def send_daily_report():
             req = _urllib.Request(LDS_API, headers={"User-Agent": "Mozilla/5.0"})
             lds = _json.loads(_urllib.urlopen(req, context=ctx, timeout=20).read().decode())
 
-            try:
-                req3 = _urllib.Request(CHAT_STATS_API, headers={"User-Agent": "Mozilla/5.0"})
-                chat_stats = _json.loads(_urllib.urlopen(req3, context=ctx, timeout=20).read().decode())
-            except Exception:
-                chat_stats = None
-
-            # DocuScan Supabase query (credentials loaded from .env)
-            try:
-                docu_req = _urllib.Request(
-                    f"{SUPABASE_URL}/rest/v1/documents?select=id,doc_type,status,created_at",
-                    headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "User-Agent": "Mozilla/5.0"}
-                )
-                docu_data = _json.loads(_urllib.urlopen(docu_req, context=ctx, timeout=15).read().decode())
-                today_docs = [d for d in docu_data if (d.get('created_at') or '')[:10] == date_str]
-                docu_stats = {
-                    'total': len(docu_data),
-                    'today': len(today_docs),
-                    'pending': sum(1 for d in docu_data if d.get('status') == 'pending_review'),
-                    'confirmed': sum(1 for d in docu_data if d.get('status') == 'confirmed'),
-                    'exported': sum(1 for d in docu_data if d.get('status') == 'exported'),
-                }
-            except Exception:
-                docu_stats = None
-
             # LDS section
             lds_lines = [
                 "🎰 【抽奖系统 LDS】",
@@ -2453,37 +2492,11 @@ def send_daily_report():
             else:
                 book_lines.append("今日暂无预约")
 
-            # 小慧 section
-            if chat_stats and 'conversations' in chat_stats:
-                conv = chat_stats['conversations']
-                bk   = chat_stats.get('bookings', {})
-                chat_lines = [
-                    "🤖 【小慧 AI 客服】",
-                    f"今日对话：{conv.get('today', 0)} 场  本月累计：{conv.get('thisMonth', 0)} 场",
-                    f"促成预约：本月 {bk.get('thisMonth', 0)} 个  总计 {bk.get('total', 0)} 个",
-                ]
-            else:
-                chat_lines = ["🤖 【小慧 AI 客服】数据查询失败"]
-
-            # DocuScan section
-            if docu_stats:
-                docu_lines = [
-                    "📄 【DocuScan 文件系统】",
-                    f"今日扫描：{docu_stats['today']} 份  累计：{docu_stats['total']} 份",
-                    f"待审核：{docu_stats['pending']} 份  已确认：{docu_stats['confirmed']} 份  已导出：{docu_stats['exported']} 份",
-                ]
-            else:
-                docu_lines = ["📄 【DocuScan 文件系统】数据查询失败"]
-
             report = (
                 f"📊 晚报 {date_str}\n\n"
                 + "\n".join(lds_lines)
                 + "\n\n"
                 + "\n".join(book_lines)
-                + "\n\n"
-                + "\n".join(chat_lines)
-                + "\n\n"
-                + "\n".join(docu_lines)
             )
 
         send_msg(report)
@@ -2595,10 +2608,9 @@ def check_system_health():
 
     # Define systems to monitor
     systems = {
-        "HRMS": "https://script.google.com/macros/s/AKfycbzTdyny8bM_kobrbxCmaYBR3oYhVVr0n8wLGtSKj339/exec?page=api&key=zchhp2024",
-        "LDS": "https://script.google.com/macros/s/AKfycbzTxymBxmmliLWpOdg-lh-Ev6tDKyjEf91wgTaDAtxx0gtEsZZrsL9rL9AFv7-XaySlew/exec?page=api&key=zchhp2024",
+        "POS System": "https://pos-system-hazel-psi.vercel.app/api/menu/categories",
         "Booking": "https://script.google.com/macros/s/AKfycbyq1uhgRek_xCtOeAeWnS6mKxoYI4FMSiezAHlGHB-GXkJNGIZNTaotIT76CmKNvoY_/exec?page=api&key=zchhp2024",
-        "DocuScan": "https://docuscan-pro.vercel.app/api/health"  # You may need to adjust this endpoint
+        "LDS": "https://script.google.com/macros/s/AKfycbzTxymBxmmliLWpOdg-lh-Ev6tDKyjEf91wgTaDAtxx0gtEsZZrsL9rL9AFv7-XaySlew/exec?page=api&key=zchhp2024",
     }
 
     alerts = []
@@ -2625,19 +2637,150 @@ def check_system_health():
 
     save_health_state(health_state)
 
+
+def nightly_self_review(memory):
+    """23:30 自我学习：让 Claude 从今天的对话里提炼关键知识，存进 knowledge_base。"""
+    history = memory.get("history", [])
+    if not history:
+        return
+
+    # 取最近40条对话（当天为主）
+    today = time.strftime("%m/%d")
+    today_entries = [h for h in history if today in h]
+    if len(today_entries) < 3:
+        return  # 今天对话太少，不值得提炼
+
+    entries_text = "\n".join(today_entries[-40:])
+    prompt = f"""以下是今天的对话记录：
+
+{entries_text}
+
+请从这些对话中提炼出值得长期记住的知识。只提炼真正重要的内容，不要凑数。
+
+请用 JSON 格式回复，只输出 JSON，不要其他文字：
+{{
+  "people": {{"姓名": "关键信息，如职位/薪资结构/特殊情况"}},
+  "rules": ["重要业务规则或决策"],
+  "lessons": ["值得记住的教训或最佳实践"]
+}}
+
+如果某类没有新内容，对应字段用空对象/空数组。"""
+
+    try:
+        result = run_claude(prompt, memory, continue_session=False)
+        # 从结果里提取 JSON
+        json_match = re.search(r'\{[\s\S]+\}', result)
+        if not json_match:
+            return
+        extracted = json.loads(json_match.group())
+
+        kb = memory.setdefault("knowledge_base", {
+            "people": {}, "systems": {}, "rules": [], "lessons": []
+        })
+
+        # 更新 people
+        for name, info in extracted.get("people", {}).items():
+            if name and info:
+                kb["people"][name] = info
+
+        # 追加 rules（去重）
+        for rule in extracted.get("rules", []):
+            if rule and rule not in kb["rules"]:
+                kb["rules"].append(rule)
+        kb["rules"] = kb["rules"][-30:]
+
+        # 追加 lessons（去重）
+        for lesson in extracted.get("lessons", []):
+            if lesson and lesson not in kb["lessons"]:
+                kb["lessons"].append(lesson)
+        kb["lessons"] = kb["lessons"][-30:]
+
+        save_memory(memory)
+        log(f"Nightly self-review done: {len(extracted.get('people',{}))} people, "
+            f"{len(extracted.get('rules',[]))} rules, {len(extracted.get('lessons',[]))} lessons")
+    except Exception as e:
+        log(f"Nightly self-review error: {e}")
+
+
+def check_pos_anomaly():
+    """检查今日 POS 销售是否异常（vs 7天均值），如有大幅偏差则告警。"""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+
+    try:
+        # 查今天和过去7天的订单数/营业额
+        today = time.strftime("%Y-%m-%d")
+        url = f"{SUPABASE_URL}/rest/v1/pos_orders?select=total,closed_at&status=eq.closed&closed_at=gte.{today}T00:00:00"
+        req = urllib.request.Request(url, headers={
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        })
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
+            today_orders = json.loads(r.read())
+
+        if not today_orders:
+            return
+
+        today_count = len(today_orders)
+        today_revenue = sum(float(o.get("total", 0) or 0) for o in today_orders)
+
+        # 查过去7天
+        from datetime import timedelta
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        url7 = f"{SUPABASE_URL}/rest/v1/pos_orders?select=total,closed_at&status=eq.closed&closed_at=gte.{week_ago}T00:00:00&closed_at=lt.{today}T00:00:00"
+        req7 = urllib.request.Request(url7, headers={
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        })
+        with urllib.request.urlopen(req7, timeout=15, context=SSL_CTX) as r:
+            week_orders = json.loads(r.read())
+
+        if not week_orders:
+            return
+
+        avg_daily_count = len(week_orders) / 7
+        avg_daily_revenue = sum(float(o.get("total", 0) or 0) for o in week_orders) / 7
+
+        alerts = []
+        if avg_daily_count > 5 and today_count < avg_daily_count * 0.5:
+            alerts.append(f"今日订单数 {today_count} 笔，比7天均值 {avg_daily_count:.0f} 少超过50%！")
+        if avg_daily_revenue > 100 and today_revenue < avg_daily_revenue * 0.5:
+            alerts.append(f"今日营业额 RM{today_revenue:.0f}，比7天均值 RM{avg_daily_revenue:.0f} 少超过50%！")
+
+        if alerts:
+            send_msg("⚠️ POS 异常检测：\n" + "\n".join(alerts))
+            log(f"POS anomaly alert sent: {alerts}")
+
+    except Exception as e:
+        log(f"POS anomaly check error: {e}")
+
+
 def daily_reporter_thread():
-    """Background daemon thread: check time every minute, trigger report at 10:00 & 22:00."""
-    sent_keys = set()   # (date_str, hour) pairs already sent today
+    """Background daemon thread: check time every minute, trigger scheduled tasks."""
+    sent_keys = set()   # (date_str, label) pairs already sent today
     last_health_check = 0  # timestamp of last health check
+    last_mailbox_check = 0  # timestamp of last mailbox check
+
+    # Memory reference passed from main
+    _memory_ref = [None]
+
+    def get_mem():
+        """Get memory from global memory variable."""
+        try:
+            import __main__
+            return getattr(__main__, '_global_memory', None)
+        except Exception:
+            return None
 
     while True:
         try:
             now = datetime.now()
+
+            # 每日定时汇报：10:00 & 22:00
             if now.hour in REPORT_HOURS and now.minute == 0:
                 key = (now.strftime("%Y-%m-%d"), now.hour)
                 if key not in sent_keys:
                     sent_keys.add(key)
-                    # Run in a separate thread so it doesn't block the reporter loop
                     t = threading.Thread(target=send_daily_report, daemon=True)
                     t.start()
 
@@ -2650,6 +2793,15 @@ def daily_reporter_thread():
                     t.start()
                     log("PM2 status check triggered at 09:00")
 
+            # POS 异常检测：每天 14:00（午餐后检查午市数据）
+            if now.hour == 14 and now.minute == 0:
+                key = (now.strftime("%Y-%m-%d"), "pos_anomaly")
+                if key not in sent_keys:
+                    sent_keys.add(key)
+                    t = threading.Thread(target=check_pos_anomaly, daemon=True)
+                    t.start()
+                    log("POS anomaly check triggered at 14:00")
+
             # 预约汇报：每天 17:00
             if now.hour == 17 and now.minute == 0:
                 key = (now.strftime("%Y-%m-%d"), "booking_5pm")
@@ -2659,7 +2811,7 @@ def daily_reporter_thread():
                     t.start()
                     log("Booking report 17:00 triggered")
 
-            # DD Fresh 价格同步：每天 22:10（DD Fresh 22:00 更新价格）
+            # DD Fresh 价格同步：每天 22:10
             if now.hour == 22 and now.minute == 10:
                 key = (now.strftime("%Y-%m-%d"), "ddfresh")
                 if key not in sent_keys:
@@ -2677,17 +2829,38 @@ def daily_reporter_thread():
                     t.start()
                     log("eBuy price sync started")
 
-            # Check scheduled one-off tasks (e.g. special report promised to boss)
+            # 夜间自我学习：每天 23:30（提炼今天对话关键知识）
+            if now.hour == 23 and now.minute == 30:
+                key = (now.strftime("%Y-%m-%d"), "self_review")
+                if key not in sent_keys:
+                    sent_keys.add(key)
+                    mem = get_mem()
+                    if mem is not None:
+                        t = threading.Thread(
+                            target=nightly_self_review, args=(mem,), daemon=True
+                        )
+                        t.start()
+                        log("Nightly self-review triggered at 23:30")
+
+            # Check scheduled one-off tasks
             check_scheduled_tasks(now)
 
-            # Health check disabled by boss on 2026-03-05
-            # current_time = time.time()
-            # if current_time - last_health_check >= 300:
-            #     try:
-            #         check_system_health()
-            #     except Exception as e:
-            #         log(f"Health check error: {e}")
-            #     last_health_check = current_time
+            # 系统健康检查：每小时一次（整点），跳过 00:00-08:00 休息时段
+            current_time = time.time()
+            if now.minute == 0 and now.hour >= 8 and current_time - last_health_check >= 3600:
+                try:
+                    check_system_health()
+                except Exception as e:
+                    log(f"Health check error: {e}")
+                last_health_check = current_time
+
+            # 小虾留言检查：每小时一次
+            if current_time - last_mailbox_check >= 3600:
+                try:
+                    check_xiaoxia_mailbox()
+                except Exception as e:
+                    log(f"Mailbox check error: {e}")
+                last_mailbox_check = current_time
 
             # Clean up keys from previous days
             today = now.strftime("%Y-%m-%d")
